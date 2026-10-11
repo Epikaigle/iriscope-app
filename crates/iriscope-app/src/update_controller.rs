@@ -33,6 +33,36 @@ fn install_allowed(window: &MainWindow) -> bool {
         && !state.get_consultation_saving()
 }
 
+fn clear_download<T>(state: &AppState, ready: &Mutex<Option<T>>) {
+    ready
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    state.set_update_ready(false);
+    state.set_update_progress(0);
+}
+
+fn apply_check_state<T>(
+    state: &AppState,
+    ready: &Mutex<Option<T>>,
+    result: Result<Option<&str>, &str>,
+) {
+    match result {
+        Ok(version) => {
+            clear_download(state, ready);
+            state.set_update_available(version.is_some());
+            state.set_update_version(version.unwrap_or_default().into());
+            state.set_update_message(version.map_or_else(
+                || "Iriscope est à jour.".into(),
+                |version| format!("Version {version} disponible.").into(),
+            ));
+        }
+        Err(error) => {
+            state.set_update_message(format!("Vérification impossible : {error}").into());
+        }
+    }
+}
+
 impl UpdateController {
     #[allow(clippy::too_many_lines)] // Callback closures share the same controller lifetime.
     pub(super) fn install(window: &MainWindow) -> Self {
@@ -61,6 +91,7 @@ impl UpdateController {
         let check_busy = Arc::clone(&busy);
         let check_cancelled = Arc::clone(&cancelled);
         let check_available = Arc::clone(&available);
+        let check_ready = Arc::clone(&ready);
         let check_worker = Rc::clone(&worker);
         state.on_check_update(move || {
             let Some(target) = check_target.clone() else {
@@ -75,12 +106,14 @@ impl UpdateController {
             };
             let state = window.global::<AppState>();
             state.set_update_busy(true);
+            state.set_update_progress(0);
             state.set_update_message("Recherche d’une nouvelle version…".into());
             check_cancelled.store(false, Ordering::Release);
             let weak = window.as_weak();
             let busy = Arc::clone(&check_busy);
             let cancelled = Arc::clone(&check_cancelled);
             let available = Arc::clone(&check_available);
+            let ready = Arc::clone(&check_ready);
             *check_worker.borrow_mut() = Some(std::thread::spawn(move || {
                 let result =
                     iriscope_updater::check(env!("CARGO_PKG_VERSION"), &target, &cancelled);
@@ -89,24 +122,18 @@ impl UpdateController {
                     let state = window.global::<AppState>();
                     state.set_update_busy(false);
                     match result {
-                        Ok(Some(release)) => {
-                            state.set_update_version(release.version.clone().into());
-                            state.set_update_available(true);
-                            state.set_update_message(
-                                format!("Version {} disponible.", release.version).into(),
+                        Ok(release) => {
+                            apply_check_state(
+                                &state,
+                                &ready,
+                                Ok(release.as_ref().map(|release| release.version.as_str())),
                             );
                             *available
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release);
-                        }
-                        Ok(None) => {
-                            state.set_update_available(false);
-                            state.set_update_message("IrisScope est à jour.".into());
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = release;
                         }
                         Err(error) => {
-                            state.set_update_message(
-                                format!("Vérification impossible : {error}").into(),
-                            );
+                            apply_check_state(&state, &ready, Err(&error.to_string()));
                         }
                     }
                 });
@@ -135,8 +162,8 @@ impl UpdateController {
                 return;
             };
             let state = window.global::<AppState>();
+            clear_download(&state, &download_ready);
             state.set_update_busy(true);
-            state.set_update_progress(0);
             state.set_update_message("Téléchargement et vérification de la mise à jour…".into());
             download_cancelled.store(false, Ordering::Release);
             let weak = window.as_weak();
@@ -184,7 +211,11 @@ impl UpdateController {
             let Some(window) = weak.upgrade() else {
                 return;
             };
-            if !window.global::<AppState>().get_update_ready() || !install_allowed(&window) {
+            let state = window.global::<AppState>();
+            if !state.get_update_ready()
+                || state.get_update_busy()
+                || !install_allowed(&window)
+            {
                 return;
             }
             let capture_directory = std::path::PathBuf::from(window.get_settings_capture_directory().as_str());
@@ -257,6 +288,79 @@ impl UpdateController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn downloaded_update() -> (MainWindow, Mutex<Option<&'static str>>) {
+        software_platform::init();
+        let window = MainWindow::new().unwrap();
+        let state = window.global::<AppState>();
+        state.set_update_available(true);
+        state.set_update_version("0.4.4".into());
+        state.set_update_ready(true);
+        state.set_update_progress(100);
+        (window, Mutex::new(Some("0.4.4")))
+    }
+
+    #[test]
+    fn newer_release_discards_the_previously_downloaded_version() {
+        let (window, ready) = downloaded_update();
+        let state = window.global::<AppState>();
+
+        apply_check_state(&state, &ready, Ok(Some("0.4.5")));
+
+        assert!(ready.lock().unwrap().is_none());
+        assert!(!state.get_update_ready());
+        assert_eq!(state.get_update_progress(), 0);
+        assert!(state.get_update_available());
+        assert_eq!(state.get_update_version(), "0.4.5");
+        assert_eq!(state.get_update_message(), "Version 0.4.5 disponible.");
+    }
+
+    #[test]
+    fn up_to_date_result_clears_the_download_and_available_version() {
+        let (window, ready) = downloaded_update();
+        let state = window.global::<AppState>();
+
+        apply_check_state(&state, &ready, Ok(None));
+
+        assert!(ready.lock().unwrap().is_none());
+        assert!(!state.get_update_ready());
+        assert_eq!(state.get_update_progress(), 0);
+        assert!(!state.get_update_available());
+        assert!(state.get_update_version().is_empty());
+        assert_eq!(state.get_update_message(), "Iriscope est à jour.");
+    }
+
+    #[test]
+    fn failed_check_keeps_the_known_version_and_its_download() {
+        let (window, ready) = downloaded_update();
+        let state = window.global::<AppState>();
+
+        apply_check_state(&state, &ready, Err("hors ligne"));
+
+        assert_eq!(*ready.lock().unwrap(), Some("0.4.4"));
+        assert!(state.get_update_ready());
+        assert!(state.get_update_available());
+        assert_eq!(state.get_update_version(), "0.4.4");
+        assert_eq!(
+            state.get_update_message(),
+            "Vérification impossible : hors ligne"
+        );
+    }
+
+    #[test]
+    fn restarting_download_prevents_installing_the_previous_package() {
+        let (window, ready) = downloaded_update();
+        let state = window.global::<AppState>();
+
+        clear_download(&state, &ready);
+
+        assert!(ready.lock().unwrap().is_none());
+        assert!(!state.get_update_ready());
+        assert_eq!(state.get_update_progress(), 0);
+        assert!(state.get_update_available());
+        assert_eq!(state.get_update_version(), "0.4.4");
+    }
+
     #[test]
     fn install_request_cannot_close_an_active_recording_or_unsaved_notes() {
         software_platform::init();
@@ -282,6 +386,10 @@ mod tests {
         state.invoke_install_update();
         assert_eq!(count.get(), 0);
         state.set_storage_busy(false);
+        state.set_update_busy(true);
+        state.invoke_install_update();
+        assert_eq!(count.get(), 0);
+        state.set_update_busy(false);
         state.invoke_install_update();
         assert_eq!(count.get(), 1);
     }

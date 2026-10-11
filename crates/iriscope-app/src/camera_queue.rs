@@ -5,7 +5,7 @@ use crate::ui::MainWindow;
 use iriscope_core::camera::CapturedFrame;
 use iriscope_core::capabilities::{CameraControlId, CameraControlValue};
 use iriscope_core::settings::AppSettings;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -17,38 +17,43 @@ pub(super) struct ControlCommandMailbox {
 
 #[derive(Default)]
 pub(super) struct ControlCommandState {
-    pub(super) updates: VecDeque<(CameraControlId, CameraControlValue)>,
-    pub(super) reset: bool,
+    pub(super) updates: VecDeque<(CameraControlId, CameraControlValue, u64)>,
+    pub(super) reset: Option<HashMap<CameraControlId, u64>>,
     pub(super) stop: bool,
 }
 
 pub(super) struct ControlCommandBatch {
-    pub(super) updates: VecDeque<(CameraControlId, CameraControlValue)>,
-    pub(super) reset: bool,
+    pub(super) updates: VecDeque<(CameraControlId, CameraControlValue, u64)>,
+    pub(super) reset: Option<HashMap<CameraControlId, u64>>,
     pub(super) stop: bool,
 }
 
 impl ControlCommandMailbox {
-    pub(super) fn set_control(&self, id: CameraControlId, value: CameraControlValue) {
+    pub(super) fn set_control(
+        &self,
+        id: CameraControlId,
+        value: CameraControlValue,
+        revision: u64,
+    ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.stop {
-            if let Some(previous) = state.updates.iter().position(|(key, _)| *key == id) {
+            if let Some(previous) = state.updates.iter().position(|(key, _, _)| *key == id) {
                 state.updates.remove(previous);
             }
-            state.updates.push_back((id, value));
+            state.updates.push_back((id, value, revision));
         }
     }
 
-    pub(super) fn reset_controls(&self) {
+    pub(super) fn reset_controls(&self, revisions: HashMap<CameraControlId, u64>) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.updates.clear();
-        state.reset = true;
+        state.reset = Some(revisions);
     }
 
     pub(super) fn stop(&self) {
@@ -57,7 +62,7 @@ impl ControlCommandMailbox {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.stop = true;
-        state.reset = false;
+        state.reset = None;
         state.updates.clear();
     }
 
@@ -205,26 +210,35 @@ mod control_command_tests {
         let mailbox = ControlCommandMailbox::default();
         let id = CameraControlId::Standard(StandardCameraControl::Brightness);
         for value in 0..10_000 {
-            mailbox.set_control(id.clone(), CameraControlValue::Integer(value));
+            mailbox.set_control(
+                id.clone(),
+                CameraControlValue::Integer(value),
+                u64::try_from(value).expect("positive revision"),
+            );
         }
         let batch = mailbox.take();
         assert_eq!(batch.updates.len(), 1);
         assert_eq!(
             batch.updates.front(),
-            Some(&(id.clone(), CameraControlValue::Integer(9_999)))
+            Some(&(id.clone(), CameraControlValue::Integer(9_999), 9_999))
         );
 
-        mailbox.set_control(id.clone(), CameraControlValue::Integer(1));
-        mailbox.reset_controls();
-        mailbox.set_control(id.clone(), CameraControlValue::Integer(2));
+        mailbox.set_control(id.clone(), CameraControlValue::Integer(1), 10_000);
+        mailbox.reset_controls(std::collections::HashMap::from([(id.clone(), 10_001)]));
+        mailbox.set_control(id.clone(), CameraControlValue::Integer(2), 10_002);
         let batch = mailbox.take();
-        assert!(batch.reset);
+        assert_eq!(
+            batch
+                .reset
+                .and_then(|revisions| revisions.get(&id).copied()),
+            Some(10_001)
+        );
         assert_eq!(
             batch.updates.front(),
-            Some(&(id.clone(), CameraControlValue::Integer(2)))
+            Some(&(id.clone(), CameraControlValue::Integer(2), 10_002))
         );
 
-        mailbox.set_control(id, CameraControlValue::Integer(3));
+        mailbox.set_control(id, CameraControlValue::Integer(3), 10_003);
         mailbox.stop();
         let batch = mailbox.take();
         assert!(batch.stop);
@@ -236,16 +250,16 @@ mod control_command_tests {
         let mailbox = ControlCommandMailbox::default();
         let automatic = CameraControlId::Standard(StandardCameraControl::ExposureMode);
         let manual = CameraControlId::Standard(StandardCameraControl::Exposure);
-        mailbox.set_control(manual.clone(), CameraControlValue::Integer(20));
-        mailbox.set_control(automatic.clone(), CameraControlValue::Menu(1));
-        mailbox.set_control(manual.clone(), CameraControlValue::Integer(30));
+        mailbox.set_control(manual.clone(), CameraControlValue::Integer(20), 1);
+        mailbox.set_control(automatic.clone(), CameraControlValue::Menu(1), 1);
+        mailbox.set_control(manual.clone(), CameraControlValue::Integer(30), 2);
 
         let updates = mailbox.take().updates.into_iter().collect::<Vec<_>>();
         assert_eq!(
             updates,
             vec![
-                (automatic, CameraControlValue::Menu(1)),
-                (manual, CameraControlValue::Integer(30))
+                (automatic, CameraControlValue::Menu(1), 1),
+                (manual, CameraControlValue::Integer(30), 2)
             ]
         );
     }

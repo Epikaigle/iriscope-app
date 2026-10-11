@@ -5,6 +5,8 @@ pub const BACKEND_NAME: &str = "AVFoundation";
 
 #[cfg(any(target_os = "macos", test))]
 mod capabilities;
+#[cfg(any(target_os = "macos", test))]
+mod control_requests;
 
 #[cfg(target_os = "macos")]
 mod button;

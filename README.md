@@ -547,7 +547,7 @@ macOS, le `.zip` contient `IrisScope.app` avec la déclaration d'autorisation
 caméra nécessaire à AVFoundation. Les licences des polices embarquées sont
 jointes à chaque archive. Le workflow de release prépare macOS Intel et Linux sur leurs systèmes natifs, puis publie les fichiers téléchargeables.
 
-Les paquets macOS et Linux incluent les mises à jour signées depuis **Paramètres** : vérification au démarrage, téléchargement puis installation avec redémarrage. Les archives portables ne créent pas de raccourci. `python scripts/package-installer.py` produit aussi un paquet Debian avec entrée de menu, un installateur Windows par utilisateur et un DMG macOS avec accès au dossier Applications. Le workflow de release prépare les installateurs macOS Intel/Linux avec leurs empreintes, en plus des archives portables. Sous Windows, Inno Setup 6 est requis ; sous macOS, `hdiutil` est requis.
+Les paquets macOS et Linux incluent les mises à jour signées depuis **Paramètres** : vérification au démarrage, téléchargement puis installation avec redémarrage. Les archives portables ne créent pas de raccourci. `python scripts/package-installer.py` produit un paquet Debian avec entrée de menu, un installateur Windows par utilisateur et un DMG macOS avec accès au dossier Applications. Le workflow de release vérifie le formatage, l'analyse Rust et les tests avant de publier les deux installateurs macOS Intel/Linux et leurs empreintes dans le manifeste signé. Les archives portables restent disponibles par compilation locale. Sous Windows, Inno Setup 6 est requis ; sous macOS, `hdiutil` est requis.
 
 Le workflow de release publie seulement macOS Intel et Linux x86_64. Windows et Apple Silicon restent en attente d’un essai matériel.
 Le guide [Essayer sur Windows et macOS](documentation/ESSAIS-WINDOWS-MACOS.md) indique
@@ -616,8 +616,10 @@ Un seul workflow [Release macOS Intel et Linux](https://github.com/Epikaigle/iri
 fabrique les paquets optimisés, signe le manifeste de mise à jour et publie une
 release complète avec deux téléchargements : `.dmg` Mac Intel et `.deb` Linux.
 Les signatures de mise à jour sont incluses dans les notes de release et les
-mises à jour utilisent ces mêmes installateurs. Les tests sont exécutés localement avant publication ; les
-pushs de code sur `main` ne lancent plus de suites de tests ni de compilations.
+mises à jour utilisent ces mêmes installateurs. Sur Linux, le workflow exige le
+formatage, Clippy strict, les tests Rust et tous les tests Python avant publication.
+Les pushs de code
+sur `main` ne lancent plus de suites de tests ni de compilations.
 Un tag `vX.Y.Z` correspondant à `Cargo.toml` lance la publication. Le lancement
 manuel permet aussi de réutiliser des paquets Mac déjà testés localement et
 joints au brouillon, sans les recompiler. Un échec laisse la release en brouillon.
@@ -629,3 +631,5 @@ avec le DE400 restent nécessaires sur chaque système. Voir
 [Mises à jour et publication](documentation/MISES-A-JOUR.md).
 
 Les mesures reproductibles sont décrites dans [documentation/PERFORMANCE.md](documentation/PERFORMANCE.md), et les essais avec le DE400 dans [documentation/VALIDATION-MATERIELLE.md](documentation/VALIDATION-MATERIELLE.md).
+La [revue du code du 11 octobre 2026](documentation/REVUE-CODE-2026-10-11.md)
+décrit les derniers correctifs, leurs vérifications et les essais encore nécessaires.

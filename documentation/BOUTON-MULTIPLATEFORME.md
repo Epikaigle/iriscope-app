@@ -1,12 +1,16 @@
 # Bouton DE400 et développement depuis Linux
 
-État au 7 octobre 2026. Les contrôles de compilation ne remplacent pas un essai avec la caméra sur le système concerné.
+État au **11 octobre 2026**. Les contrôles de compilation, y compris la compilation croisée, ne remplacent pas un essai avec la caméra sur le système concerné.
 
 | Système | Réception du bouton | Validation réelle |
 | --- | --- | --- |
 | Linux | Passerelle `usbmon` et détection des appuis/relâchements | Photos et démarrage/arrêt vidéo validés sur le DE400 branché |
 | Windows | Abonnement natif optionnel `IKsControl::KsEvent`, événement `KSEVENT_VIDCAPTOSTI_EXT_TRIGGER` | À réaliser ; le pilote doit exposer cet événement |
-| macOS | Composant USB vidéo/bouton/réglages inclus dans le paquet ; AVFoundation disponible séparément | Le chemin ordinaire est refusé (`0xe00002c5`). Le chemin direct avec authentification administrateur est validé sur Mac Intel / macOS 15.7.7 : deux photos et démarrage/arrêt vidéo par quatre appuis réels |
+| macOS Intel | Composant USB vidéo/bouton/réglages et service autorisé inclus dans le paquet ; AVFoundation disponible séparément | Chemin direct validé sur macOS 15.7.7, dont quatre appuis réels le 8 octobre ; ouverture USB ordinaire refusée (`0xe00002c5`) |
+| macOS Apple Silicon | Code disponible ; aucun paquet dans la release actuelle | Aucun essai matériel documenté |
+
+La [release 0.4.3](RELEASE-0.4.3.md) contient deux installateurs : Linux amd64
+`.deb` et macOS Intel `.dmg`. Windows et Apple Silicon ne sont pas publiés.
 
 Le bouton de capture à l'écran et les raccourcis utilisent le même traitement photo/vidéo sur les trois systèmes. Ce traitement est distinct de la réception du bouton matériel.
 
@@ -56,8 +60,15 @@ Aucun mot de passe ni pilote Apple modifié n'est installé. Une mise à jour du
 lanceur ou des composants USB peut nécessiter une nouvelle autorisation.
 Voir [Autorisation USB conservée](ACCES-USB-MACOS.md).
 Le lancement, les sondes et le retour vérifié à AVFoundation sont détaillés dans
-le [rapport Mac](VALIDATION-MACOS-2026-10-07.md). Les autres versions de macOS et
-les Mac Apple Silicon ne sont pas validés physiquement.
+le [rapport Mac du 7 octobre](VALIDATION-MACOS-2026-10-07.md).
+Le [rapport du 8 octobre](VALIDATION-MACOS-2026-10-08.md) confirme quatre nouveaux
+appuis physiques, une vidéo de 53 images lisibles et les huit réglages, ainsi que
+l'installation du service et la conservation de l'autorisation sans mot de passe
+à chaque ouverture. Le [rapport 0.4.3 du 9 octobre](VALIDATION-0.4.3-MACOS-2026-10-09.md)
+vérifie le paquet final, une mise à jour réelle et la conservation des données.
+Ses captures complémentaires sont déclenchées par logiciel ; le lecteur et le
+service USB restent identiques à ceux testés physiquement. Les autres versions
+de macOS et les Mac Apple Silicon ne sont pas validés physiquement.
 
 Le chemin ordinaire conserve AVFoundation pour le flux vidéo. Un thread natif utilisant IOKit, via `nusb`, recherche le même DE400 avec son emplacement USB encodé dans l’identifiant AVFoundation. Il ouvre uniquement l’interface de contrôle vidéo et lit l’endpoint d’interruption `0x81`, avec les paquets mesurés sous Linux. L’appui est dédoublonné jusqu’au relâchement ; sa file reste indépendante des images. Le récepteur est arrêté et les notifications sont effacées à chaque arrêt ou redémarrage du flux.
 
@@ -67,7 +78,21 @@ Dans **Paramètres → Diagnostic**, « réception USB macOS active » signifie 
 
 ## Un seul poste de développement
 
-Les modifications des trois backends, de l'interface et des tests se font dans le dépôt Linux. `scripts/ci-local.sh` contrôle le code des cibles Windows x86_64, Mac Intel et Mac Apple Silicon depuis Linux. La validation complète GitHub, lancée depuis **Actions → CI → Run workflow** avec **full_validation** cochée ou par un tag `v*`, construit et teste aussi l'application sur des machines Linux, Windows et macOS ; elle produit leurs paquets natifs. Les modifications du backend Mac ou de `scripts/macos/` lancent aussi cette validation native complète. Les autres CI automatiques légères vérifient seulement les fichiers modifiés et ne produisent pas de paquet. GitHub ne possède pas l'iriscope physique.
+Les modifications des trois backends, de l'interface et des tests peuvent se
+faire dans le dépôt Linux. `scripts/ci-local.sh` vérifie le formatage, Clippy et
+les tests natifs, puis contrôle par compilation croisée les cibles Windows
+x86_64, Mac Intel et Mac Apple Silicon. Il n'exécute pas leurs tests natifs et
+ne remplace pas un essai physique sur ces machines.
+
+Le workflow [Release macOS Intel et Linux](../.github/workflows/release.yml),
+lancé depuis **Actions → Release macOS Intel et Linux → Run workflow** ou par
+un tag `v*`, produit les deux installateurs publiés. Sur Linux, il vérifie le
+formatage Rust, Clippy strict, les tests Rust du workspace sous Xvfb et les
+tests Python avant de construire le paquet. Le paquet Mac est construit sur
+Mac Intel ou réutilisé depuis un brouillon contenant un paquet déjà testé.
+Il n'y a plus de CI générale automatique pour chaque changement du logiciel.
+Les changements du site dans `docs` sur `main` déclenchent sa publication par
+ce même workflow. GitHub ne possède pas l'iriscope physique.
 
 Un Mac et un PC Windows sont utiles uniquement pour installer le paquet et faire l'essai matériel, sans installer un environnement de développement. Après fermeture des autres applications utilisant la caméra, lancer l'exécutable natif avec `--diagnose`, puis `--validate-button` suivi d'un chemin vers un dossier vide. Sur macOS, vérifier d’abord l’état du récepteur dans le diagnostic. Si l’accès USB est refusé, le scénario de bouton ne peut pas réussir ; `--validate-hardware` vérifie séparément les captures logicielles. Le scénario crée des dossiers fictifs et conserve les paramètres personnels. Voir le [protocole matériel](VALIDATION-MATERIELLE.md).
 

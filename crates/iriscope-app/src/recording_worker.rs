@@ -22,7 +22,7 @@ use iriscope_core::settings::AppSettings;
 use iriscope_core::storage::CaptureTimestamp;
 #[cfg(test)]
 use iriscope_core::video::AviMjpegReader;
-use iriscope_core::video::{AviMjpegWriter, recover_partial_avi_staged};
+use iriscope_core::video::{AviMjpegWriter, recover_partial_avi_staged_with_validation};
 use iriscope_imaging::{decode_mjpeg_to_rgb8, encode_rgb8_jpeg, ensure_jpeg_has_dht};
 use slint::{Rgb8Pixel, SharedPixelBuffer};
 use std::collections::VecDeque;
@@ -273,18 +273,22 @@ pub(super) fn recover_indexed_recording(
     directory: &std::path::Path,
     file_name: &str,
 ) -> std::io::Result<Option<CaptureCommit>> {
-    recover_partial_avi_staged(source, directory)?
-        .map(|pending| {
-            publish_indexed_capture(
-                &pending,
-                directory,
-                file_name,
-                &CaptureSession::default(),
-                CaptureKind::Video,
-                CaptureTimestamp::now(),
-            )
+    recover_partial_avi_staged_with_validation(source, directory, |jpeg, width, height| {
+        decode_mjpeg_to_rgb8(jpeg).is_ok_and(|(decoded_width, decoded_height, _)| {
+            (decoded_width, decoded_height) == (width, height)
         })
-        .transpose()
+    })?
+    .map(|pending| {
+        publish_indexed_capture(
+            &pending,
+            directory,
+            file_name,
+            &CaptureSession::default(),
+            CaptureKind::Video,
+            CaptureTimestamp::now(),
+        )
+    })
+    .transpose()
 }
 
 pub(super) fn stop_recording(
@@ -766,9 +770,10 @@ mod recording_pipeline_tests {
     use super::{
         ActiveRecording, AviMjpegReader, AviMjpegWriter, DecodeMailbox, PhotoRequest,
         RecordingCommand, RecordingMailbox, RecordingRequest, RecordingStopReason,
-        RecordingTimeline, decode_camera_frame_to_rgb8, encode_rgb8_jpeg, library_context_matches,
-        pending_recording_paths, publish_finished_video, recording_context_matches,
-        recover_indexed_recording, save_photo, try_scan_library_directory,
+        RecordingTimeline, decode_camera_frame_to_rgb8, decode_mjpeg_to_rgb8, encode_rgb8_jpeg,
+        library_context_matches, pending_recording_paths, publish_finished_video,
+        recording_context_matches, recover_indexed_recording, save_photo,
+        try_scan_library_directory,
     };
 
     pub(super) fn frame(sequence_number: u64) -> CapturedFrame {
@@ -1020,6 +1025,62 @@ mod recording_pipeline_tests {
         assert_eq!(recovered_entry.first_name, None);
         assert_eq!(recovered_entry.last_name, None);
         fs::remove_dir_all(directory).expect("remove recovery test directory");
+    }
+
+    fn corrupt_jpeg() -> Vec<u8> {
+        let mut jpeg = encode_rgb8_jpeg(&[255, 0, 0], 1, 1, 95).expect("JPEG");
+        let table = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xdb])
+            .expect("quantization table");
+        jpeg[table + 2..table + 4].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(decode_mjpeg_to_rgb8(&jpeg).is_err());
+        jpeg
+    }
+
+    #[test]
+    fn recovery_skips_undecodable_and_wrong_size_frames() {
+        let (mut recording, directory) = test_recording(FrameRate::new(8, 1).expect("frame rate"));
+        let valid = encode_rgb8_jpeg(&[255, 0, 0], 1, 1, 95).expect("valid JPEG");
+        let wrong_size = encode_rgb8_jpeg(&[255, 0, 0, 0, 255, 0], 2, 1, 95).expect("larger JPEG");
+        for jpeg in [&valid, &corrupt_jpeg(), &wrong_size] {
+            recording.writer.write_frame(jpeg).expect("source frame");
+        }
+        recording.writer.finish().expect("finish source");
+        let source = recording.pending_path.clone();
+        drop(recording);
+        let original = fs::read(&source).expect("source bytes");
+        let committed = recover_indexed_recording(&source, &directory, "recovered.avi")
+            .expect("recover")
+            .expect("one decodable frame");
+        let mut reader = AviMjpegReader::open(&committed.file_path).expect("recovered AVI");
+        assert_eq!(reader.frame_count(), 1);
+        assert_eq!(reader.read_frame(0).expect("recovered frame"), valid);
+        assert_eq!(fs::read(&source).expect("preserved source"), original);
+        drop(reader);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn recovery_preserves_source_when_no_frame_is_decodable() {
+        let (mut recording, directory) = test_recording(FrameRate::new(8, 1).expect("frame rate"));
+        recording
+            .writer
+            .write_frame(&corrupt_jpeg())
+            .expect("source frame");
+        recording.writer.finish().expect("finish source");
+        let source = recording.pending_path.clone();
+        drop(recording);
+        let original = fs::read(&source).expect("source bytes");
+        assert!(
+            recover_indexed_recording(&source, &directory, "recovered.avi")
+                .expect("recover")
+                .is_none()
+        );
+        assert_eq!(fs::read(&source).expect("preserved source"), original);
+        assert!(!directory.join("recovered.avi").exists());
+        assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     fn test_recording(rate: FrameRate) -> (ActiveRecording, std::path::PathBuf) {

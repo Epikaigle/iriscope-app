@@ -49,13 +49,25 @@ jobs:
         if: matrix.platform != 'macos' || !inputs.reuse_macos
         with:
           toolchain: 1.89.0
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         if: matrix.platform != 'macos' || !inputs.reuse_macos
         with:
           key: native-${{ matrix.os }}
       - name: Dépendances Linux
         if: matrix.platform == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libfontconfig1-dev libxkbcommon-x11-dev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libfontconfig1-dev libxkbcommon-x11-dev xvfb xauth ffmpeg
+      - name: Vérifier le code et les tests avant publication
+        if: matrix.platform == 'linux'
+        env:
+          CARGO_BUILD_JOBS: 1
+          SLINT_BACKEND: winit-software
+        run: |
+          python -m pip install 'cryptography>=46,<50'
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          xvfb-run -a cargo test --workspace --locked
+          python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Compiler les programmes optimisés
         if: matrix.platform != 'macos' || !inputs.reuse_macos
         run: cargo build --release -p iriscope-app -p iriscope-updater --locked

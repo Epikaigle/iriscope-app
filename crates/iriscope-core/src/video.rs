@@ -360,6 +360,23 @@ pub fn recover_partial_avi(
 ///
 /// Returns an error for an invalid header, unsupported bounds or failed I/O.
 pub fn recover_partial_avi_staged(source: &Path, directory: &Path) -> io::Result<Option<PathBuf>> {
+    recover_partial_avi_staged_with_validation(source, directory, |_, _, _| true)
+}
+
+/// Salvages complete JPEG chunks accepted by the caller's codec validation.
+///
+/// The validator receives the encoded JPEG and the dimensions from the AVI
+/// header. Rejected frames are skipped; the original source is preserved. No
+/// temporary AVI is kept when none of its frames can be recovered.
+///
+/// # Errors
+///
+/// Returns an error for an invalid header, unsupported bounds or failed I/O.
+pub fn recover_partial_avi_staged_with_validation(
+    source: &Path,
+    directory: &Path,
+    validate_frame: impl Fn(&[u8], u32, u32) -> bool,
+) -> io::Result<Option<PathBuf>> {
     let mut input = File::open(source)?;
     let file_len = input.metadata()?.len();
     if file_len < 2_048 || file_len > u64::from(u32::MAX) + 8 {
@@ -404,7 +421,7 @@ pub fn recover_partial_avi_staged(source: &Path, directory: &Path) -> io::Result
             input.read_exact(&mut jpeg)?;
             // A complete AVI chunk can still hold an interrupted JPEG.
             // Keep the source intact and salvage only intact envelopes.
-            if has_jpeg_envelope(&jpeg) {
+            if has_jpeg_envelope(&jpeg) && validate_frame(&jpeg, width, height) {
                 writer.write_frame(&jpeg)?;
                 recovered += 1;
             }
@@ -458,6 +475,12 @@ fn checked_frame_capacity(
     frame_size: usize,
     existing_frames: usize,
 ) -> io::Result<(u32, u32)> {
+    if existing_frames >= MAX_AVI_FRAMES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recording reached the supported AVI playback frame limit",
+        ));
+    }
     if frame_size > MAX_AVI_FRAME_BYTES as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -962,6 +985,13 @@ mod tests {
         assert!(checked_frame_capacity(near_limit, header, 32, 1).is_err());
         assert!(checked_frame_capacity(header, header, usize::MAX, 0).is_err());
         assert!(checked_frame_capacity(header, header, 32 * 1024 * 1024 + 1, 0).is_err());
+    }
+
+    #[test]
+    fn writer_respects_the_readers_frame_count_limit() {
+        let header = 2_048_u64;
+        assert!(checked_frame_capacity(header, header, 1, super::MAX_AVI_FRAMES - 1).is_ok());
+        assert!(checked_frame_capacity(header, header, 1, super::MAX_AVI_FRAMES).is_err());
     }
 
     #[test]

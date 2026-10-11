@@ -995,3 +995,169 @@ fn correcting_names_preserves_identity_captures_and_rejects_concurrent_edits() {
     );
     fs::remove_dir_all(directory).unwrap();
 }
+
+fn capture_with_deferred_index(directory: &Path, session: &CaptureSession) -> super::CaptureCommit {
+    let backup = directory.join(super::LIBRARY_INDEX_BACKUP_FILE);
+    fs::remove_file(&backup).expect("remove index backup");
+    fs::create_dir(&backup).expect("block index publication");
+    let capture = save_indexed_capture(
+        directory,
+        "pending.jpg",
+        b"published media",
+        session,
+        CaptureKind::Photo,
+        CaptureTimestamp::now(),
+    )
+    .expect("media published despite index error");
+    assert!(capture.metadata_warning.is_some());
+    assert_eq!(fs::read(&capture.file_path).unwrap(), b"published media");
+    fs::remove_dir(backup).expect("unblock index publication");
+    capture
+}
+
+#[test]
+fn pending_capture_replays_after_name_correction_and_keeps_the_selected_dossier() {
+    let directory = fingerprint_test_directory("pending-correct-dossier");
+    let patient = create_patient(&directory, "Jeam", "Dupont").unwrap();
+    let homonym = create_patient(&directory, "Jean", "Dupont").unwrap();
+    let mut original_session = CaptureSession::new("Jeam", "Dupont", Eye::Right);
+    original_session.set_patient_id(Some(patient.id));
+    let capture = capture_with_deferred_index(&directory, &original_session);
+
+    super::update_patient(&directory, patient.id, "Jeam", "Dupont", "Jean", "Dupont").unwrap();
+    assert_eq!(
+        super::recover_pending_capture_metadata(&directory).unwrap(),
+        1
+    );
+    let entries = try_scan_library_directory(&directory).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].patient_id, Some(patient.id));
+    assert_ne!(entries[0].patient_id, Some(homonym.id));
+    assert_eq!(entries[0].first_name.as_deref(), Some("Jean"));
+    assert_eq!(entries[0].last_name.as_deref(), Some("Dupont"));
+    assert_eq!(fs::read(&capture.file_path).unwrap(), b"published media");
+    assert!(
+        get_patient(&directory, patient.id)
+            .unwrap()
+            .unwrap()
+            .last_capture
+            .is_some()
+    );
+    assert_eq!(
+        super::recover_pending_capture_metadata(&directory).unwrap(),
+        0
+    );
+
+    let stale_result = save_indexed_capture(
+        &directory,
+        "stale.jpg",
+        b"stale session media",
+        &original_session,
+        CaptureKind::Photo,
+        CaptureTimestamp::now(),
+    );
+    assert_eq!(
+        stale_result
+            .expect_err("new capture still validates current names")
+            .to_string(),
+        "selected dossier does not match capture names"
+    );
+    assert!(!directory.join("stale.jpg").exists());
+
+    let mut corrected_session = CaptureSession::new("Jean", "Dupont", Eye::Right);
+    corrected_session.set_patient_id(Some(patient.id));
+    let next = save_indexed_capture(
+        &directory,
+        "next.jpg",
+        b"next media",
+        &corrected_session,
+        CaptureKind::Photo,
+        CaptureTimestamp::now(),
+    )
+    .expect("new capture succeeds after replay");
+    assert_eq!(next.metadata_warning, None);
+    let entries = try_scan_library_directory(&directory).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.patient_id == Some(patient.id))
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn pending_capture_rejects_a_missing_dossier_without_reassociating_by_name() {
+    let directory = fingerprint_test_directory("pending-missing-dossier");
+    let patient = create_patient(&directory, "Jean", "Dupont").unwrap();
+    let homonym = create_patient(&directory, "Jean", "Dupont").unwrap();
+    let mut session = CaptureSession::new("Jean", "Dupont", Eye::Left);
+    session.set_patient_id(Some(patient.id));
+    let capture = capture_with_deferred_index(&directory, &session);
+    let mut index = load_library_index(&directory).unwrap();
+    index.patients.remove(&patient.id);
+    save_library_index(&directory, &index).unwrap();
+
+    assert_eq!(
+        super::recover_pending_capture_metadata(&directory)
+            .expect_err("deleted dossier must not resolve to its homonym")
+            .to_string(),
+        "selected dossier does not exist"
+    );
+    assert!(load_library_index(&directory).unwrap().entries.is_empty());
+    assert!(get_patient(&directory, homonym.id).unwrap().is_some());
+    assert_eq!(fs::read(capture.file_path).unwrap(), b"published media");
+    assert_eq!(
+        super::capture_transactions::pending_destination_names(&directory)
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn pending_capture_rejects_a_conflicting_dossier_and_preserves_the_journal() {
+    let directory = fingerprint_test_directory("pending-conflicting-dossier");
+    let patient = create_patient(&directory, "Jean", "Dupont").unwrap();
+    let other = create_patient(&directory, "Jean", "Dupont").unwrap();
+    let mut other_session = CaptureSession::new("Jean", "Dupont", Eye::Left);
+    other_session.set_patient_id(Some(other.id));
+    let existing = save_indexed_capture(
+        &directory,
+        "existing.jpg",
+        b"existing media",
+        &other_session,
+        CaptureKind::Photo,
+        CaptureTimestamp::now(),
+    )
+    .unwrap();
+    assert_eq!(existing.metadata_warning, None);
+    let mut session = CaptureSession::new("Jean", "Dupont", Eye::Right);
+    session.set_patient_id(Some(patient.id));
+    let capture = capture_with_deferred_index(&directory, &session);
+    let mut index = load_library_index(&directory).unwrap();
+    let conflicting = index.entries.get("existing.jpg").unwrap().clone();
+    index.entries.insert("pending.jpg".to_owned(), conflicting);
+    save_library_index(&directory, &index).unwrap();
+
+    assert_eq!(
+        super::recover_pending_capture_metadata(&directory)
+            .expect_err("conflicting association must not be overwritten")
+            .to_string(),
+        "capture index already contains another dossier; journal preserved"
+    );
+    assert_eq!(
+        load_library_index(&directory).unwrap().entries["pending.jpg"].patient_id,
+        Some(other.id)
+    );
+    assert_eq!(fs::read(capture.file_path).unwrap(), b"published media");
+    assert_eq!(fs::read(existing.file_path).unwrap(), b"existing media");
+    assert_eq!(
+        super::capture_transactions::pending_destination_names(&directory)
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::remove_dir_all(directory).unwrap();
+}

@@ -17,7 +17,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use super::CaptureKind;
 use super::{
     CaptureFileVersion, LIBRARY_INDEX_WRITE_LOCK, LibraryIndex, NEXT_INDEX_WRITE_ID,
-    StoredCaptureMetadata, capture_file_version, capture_file_version_fast,
+    StoredCaptureMetadata, StoredPatient, capture_file_version, capture_file_version_fast,
     capture_file_version_fast_from_file, capture_file_version_from_file,
     ensure_local_regular_capture, load_library_index, load_library_index_for_write,
     lock_library_index, normalized_patient_name, recover_library_index_locked, save_library_index,
@@ -585,6 +585,24 @@ fn capture_metadata(
 }
 
 fn validate_dossier(metadata: &StoredCaptureMetadata, index: &LibraryIndex) -> io::Result<()> {
+    if let Some(patient) = selected_dossier(metadata, index)?
+        && (normalized_patient_name(&patient.first_name)
+            != normalized_patient_name(metadata.first_name.as_deref().unwrap_or(""))
+            || normalized_patient_name(&patient.last_name)
+                != normalized_patient_name(metadata.last_name.as_deref().unwrap_or("")))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "selected dossier does not match capture names",
+        ));
+    }
+    Ok(())
+}
+
+fn selected_dossier<'a>(
+    metadata: &StoredCaptureMetadata,
+    index: &'a LibraryIndex,
+) -> io::Result<Option<&'a StoredPatient>> {
     if metadata.patient_id.is_none()
         && (metadata.first_name.is_some() || metadata.last_name.is_some())
     {
@@ -594,24 +612,14 @@ fn validate_dossier(metadata: &StoredCaptureMetadata, index: &LibraryIndex) -> i
         ));
     }
     if let Some(id) = metadata.patient_id {
-        let patient = index.patients.get(&id).ok_or_else(|| {
+        return index.patients.get(&id).map(Some).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "selected dossier does not exist",
             )
-        })?;
-        if normalized_patient_name(&patient.first_name)
-            != normalized_patient_name(metadata.first_name.as_deref().unwrap_or(""))
-            || normalized_patient_name(&patient.last_name)
-                != normalized_patient_name(metadata.last_name.as_deref().unwrap_or(""))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "selected dossier does not match capture names",
-            ));
-        }
+        });
     }
-    Ok(())
+    Ok(None)
 }
 
 fn commit_pending_metadata(
@@ -620,7 +628,14 @@ fn commit_pending_metadata(
     index: &mut LibraryIndex,
     verified_version: Option<(&CaptureFileVersion, bool)>,
 ) -> io::Result<()> {
-    validate_dossier(&pending.metadata, index)?;
+    let patient = selected_dossier(&pending.metadata, index)?;
+    let mut metadata = pending.metadata.clone();
+    if let Some(patient) = patient {
+        // The journal was validated before publication. A later name correction
+        // must retain its explicit dossier ID and use that dossier's current names.
+        metadata.first_name = Some(patient.first_name.clone());
+        metadata.last_name = Some(patient.last_name.clone());
+    }
     if index
         .entries
         .get(&pending.destination_file)
@@ -642,7 +657,6 @@ fn commit_pending_metadata(
             "published capture was replaced or is incomplete; dossier journal preserved",
         ));
     }
-    let mut metadata = pending.metadata.clone();
     let file_version = if let Some((verified, stable_baseline)) = verified_version {
         if !published_version_matches(&path, verified, stable_baseline)? {
             return Err(io::Error::new(
@@ -787,7 +801,7 @@ pub(super) fn recover_pending_locked(
         let destination = directory.join(&pending.destination_file);
         ensure_local_regular_capture(directory, &staging)?;
         ensure_local_regular_capture(directory, &destination)?;
-        validate_dossier(&pending.metadata, index)?;
+        let _ = selected_dossier(&pending.metadata, index)?;
         complete_pending_media(&pending, &staging, &destination)?;
         commit_pending_metadata(directory, &pending, index, None)?;
         cleanup_pending(

@@ -15,6 +15,24 @@ pub(super) struct CameraControlRuntimeState {
     pub(super) key: String,
     pub(super) descriptor: CameraControlDescriptor,
     pub(super) value: CameraControlValue,
+    /// Changes with every UI request so readbacks cannot replace newer commands.
+    pub(super) revision: u64,
+}
+
+pub(super) fn merge_camera_control_readbacks(
+    states: &mut [CameraControlRuntimeState],
+    readbacks: &[CameraControlRuntimeState],
+) -> Vec<usize> {
+    readbacks
+        .iter()
+        .filter_map(|readback| {
+            let index = states.iter().position(|state| {
+                state.descriptor.id == readback.descriptor.id && state.revision == readback.revision
+            })?;
+            states[index].value.clone_from(&readback.value);
+            Some(index)
+        })
+        .collect()
 }
 
 pub(super) fn camera_control_key(id: &CameraControlId) -> String {
@@ -190,6 +208,7 @@ pub(super) fn camera_control_ui_data(state: &CameraControlRuntimeState) -> Camer
                     key: state.key.clone(),
                     descriptor: state.descriptor.clone(),
                     value: fallback,
+                    revision: state.revision,
                 });
             }
             data.read_only = true;
@@ -330,6 +349,7 @@ mod camera_control_settings_tests {
                 read_only: false,
             },
             value: CameraControlValue::Integer(20),
+            revision: 0,
         });
         assert_eq!(row.name.as_str(), "Contraste");
         assert_eq!(row.step, 5.0);

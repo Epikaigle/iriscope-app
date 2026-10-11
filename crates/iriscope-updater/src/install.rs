@@ -107,6 +107,7 @@ impl ReadyUpdate {
     ) -> Result<()> {
         let helper = self.directory.path().join("installer");
         std::fs::copy(source, &helper)?;
+        #[cfg(unix)]
         executable_permissions(&helper)?;
         let plan = Plan {
             target: target.clone(),
@@ -141,12 +142,10 @@ struct Plan {
     launcher_pid: u32,
 }
 
+#[cfg(unix)]
 fn executable_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
     Ok(())
 }
 
@@ -162,6 +161,7 @@ fn launcher_pid() -> u32 {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_process(pid: u32) -> Result<()> {
     if pid == 0 {
         return Ok(());
@@ -169,19 +169,25 @@ fn wait_for_process(pid: u32) -> Result<()> {
     let pid = i32::try_from(pid)?;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        #[cfg(unix)]
+        // SAFETY: signal 0 queries existence and sends no signal.
+        if unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         {
-            // SAFETY: signal 0 queries existence and sends no signal.
-            if unsafe { libc::kill(pid, 0) } != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                return Ok(());
-            }
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err("L’application ne s’est pas fermée ; installation annulée.".into());
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_process(pid: u32) -> Result<()> {
+    if pid == 0 {
+        Ok(())
+    } else {
+        Err("Les mises à jour intégrées nécessitent macOS ou Linux.".into())
     }
 }
 
@@ -211,7 +217,11 @@ pub(crate) fn unpack(archive: &Path, destination: &Path) -> Result<()> {
         if total > 1024 * 1024 * 1024 {
             return Err("Archive trop volumineuse".into());
         }
+        #[cfg(unix)]
         let executable = entry.header().mode()? & 0o111 != 0;
+        // Validate the mode field even where Unix permissions do not apply.
+        #[cfg(not(unix))]
+        let _ = entry.header().mode()?;
         if !entry.unpack_in(destination)? {
             return Err("Chemin sortant du dossier d’installation".into());
         }
@@ -292,6 +302,11 @@ fn unpack_disk_image(archive: &Path, destination: &Path) -> Result<()> {
         return Err("Impossible de fermer le disque d’installation macOS".into());
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unpack_disk_image(_: &Path, _: &Path) -> Result<()> {
+    Err("Disque macOS incompatible avec ce système".into())
 }
 
 fn replace_and_launch(
@@ -479,10 +494,7 @@ pub fn apply_plan(plan_path: &Path) -> Result<()> {
                 .extension()
                 .is_some_and(|extension| extension == "dmg")
         {
-            #[cfg(target_os = "macos")]
             unpack_disk_image(&archive, stage.path())?;
-            #[cfg(not(target_os = "macos"))]
-            return Err("Disque macOS incompatible avec ce système".into());
         } else {
             unpack(&archive, stage.path())?;
         }

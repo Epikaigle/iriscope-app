@@ -6,7 +6,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use av_foundation::{
@@ -60,6 +60,7 @@ use objc2_foundation::{NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSStr
 use crate::capabilities::{
     frame_rate_from_duration_parts, frame_rate_in_range, merge_mode, pixel_format_from_ostype,
 };
+use crate::control_requests::dispatch_control_request;
 use crate::events::EventMailbox;
 
 /// Native macOS camera backend using `AVFoundation`.
@@ -143,14 +144,16 @@ enum WorkerCommand {
     Stop(SyncSender<CameraResult<()>>),
     GetControl(
         CameraControlId,
+        Instant,
         SyncSender<CameraResult<CameraControlValue>>,
     ),
     SetControl(
         CameraControlId,
         CameraControlValue,
+        Instant,
         SyncSender<CameraResult<()>>,
     ),
-    ResetControls(SyncSender<CameraResult<()>>),
+    ResetControls(Instant, SyncSender<CameraResult<()>>),
     Shutdown,
 }
 
@@ -226,7 +229,11 @@ impl CameraDevice for MacAvFoundationDevice {
     fn control_value(&self, control_id: &CameraControlId) -> CameraResult<CameraControlValue> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.request_worker(
-            WorkerCommand::GetControl(control_id.clone(), response_sender),
+            WorkerCommand::GetControl(
+                control_id.clone(),
+                Instant::now() + WORKER_COMMAND_TIMEOUT,
+                response_sender,
+            ),
             &response_receiver,
             "reading an AVFoundation control",
         )
@@ -239,7 +246,12 @@ impl CameraDevice for MacAvFoundationDevice {
     ) -> CameraResult<()> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.request_worker(
-            WorkerCommand::SetControl(control_id.clone(), value.clone(), response_sender),
+            WorkerCommand::SetControl(
+                control_id.clone(),
+                value.clone(),
+                Instant::now() + WORKER_COMMAND_TIMEOUT,
+                response_sender,
+            ),
             &response_receiver,
             "setting an AVFoundation control",
         )
@@ -248,7 +260,7 @@ impl CameraDevice for MacAvFoundationDevice {
     fn reset_controls(&mut self) -> CameraResult<()> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.request_worker(
-            WorkerCommand::ResetControls(response_sender),
+            WorkerCommand::ResetControls(Instant::now() + WORKER_COMMAND_TIMEOUT, response_sender),
             &response_receiver,
             "resetting AVFoundation controls",
         )
@@ -395,14 +407,20 @@ fn mac_device_worker(
                 events.clear();
                 let _ = response_sender.send(Ok(()));
             }
-            WorkerCommand::GetControl(control_id, response_sender) => {
-                let _ = response_sender.send(mac_control_value(&device, &control_id));
+            WorkerCommand::GetControl(control_id, deadline, response_sender) => {
+                dispatch_control_request(deadline, &response_sender, || {
+                    mac_control_value(&device, &control_id)
+                });
             }
-            WorkerCommand::SetControl(control_id, value, response_sender) => {
-                let _ = response_sender.send(set_mac_control_value(&device, &control_id, &value));
+            WorkerCommand::SetControl(control_id, value, deadline, response_sender) => {
+                dispatch_control_request(deadline, &response_sender, || {
+                    set_mac_control_value(&device, &control_id, &value)
+                });
             }
-            WorkerCommand::ResetControls(response_sender) => {
-                let _ = response_sender.send(reset_mac_controls(&device));
+            WorkerCommand::ResetControls(deadline, response_sender) => {
+                dispatch_control_request(deadline, &response_sender, || {
+                    reset_mac_controls(&device)
+                });
             }
             WorkerCommand::Shutdown => break,
         }

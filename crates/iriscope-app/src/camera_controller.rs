@@ -5,20 +5,25 @@ use crate::app_helpers::{
 use crate::config::NOTICE_ERROR;
 use crate::controls_ui::{
     CameraControlRuntimeState, camera_control_key, compatible_saved_camera_control_value,
-    default_camera_control_value, remember_camera_control_value, selected_camera_menu_value,
-    set_camera_control_model, snap_integer_control_value, update_camera_control_row,
+    default_camera_control_value, merge_camera_control_readbacks, remember_camera_control_value,
+    selected_camera_menu_value, set_camera_control_model, snap_integer_control_value,
+    update_camera_control_row,
 };
 use crate::platform_camera;
 use crate::playback::{camera_error_status, is_de400, show_capture_notice};
 use crate::recording_worker::{RecordingStopReason, stop_recording};
 use crate::runtime::AppRuntime;
 use crate::ui::{AppState, MainWindow};
-use iriscope_core::camera::{CameraErrorKind, CameraEvent};
-use iriscope_core::capabilities::{CameraControlKind, CameraControlValue};
+use iriscope_core::camera::{CameraDevice, CameraErrorKind, CameraEvent, CameraResult};
+use iriscope_core::capabilities::{
+    CameraControlDescriptor, CameraControlId, CameraControlKind, CameraControlValue,
+    StandardCameraControl,
+};
+use iriscope_core::settings::SavedCameraControlValue;
 use slint::{ComponentHandle, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -119,8 +124,7 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
             if state.value == value {
                 return;
             }
-            state.value = value.clone();
-            control_commands_value.set_control(state.descriptor.id.clone(), value.clone());
+            submit_camera_control_request(state, value, &control_commands_value);
             let updated_controls = controls.clone();
             drop(controls);
             update_camera_control_row(&win, &updated_controls, index);
@@ -167,8 +171,7 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
                 return;
             }
             let value = CameraControlValue::Integer(next);
-            state.value = value.clone();
-            control_commands_step.set_control(state.descriptor.id.clone(), value);
+            submit_camera_control_request(state, value, &control_commands_step);
             let updated_controls = controls.clone();
             drop(controls);
             update_camera_control_row(&win, &updated_controls, index);
@@ -195,11 +198,7 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
                 return;
             }
             let value = CameraControlValue::Boolean(requested);
-            if state.value == value {
-                return;
-            }
-            state.value = value.clone();
-            control_commands_bool.set_control(state.descriptor.id.clone(), value.clone());
+            submit_camera_control_request(state, value, &control_commands_bool);
             let updated_controls = controls.clone();
             drop(controls);
             set_camera_control_model(&win, &updated_controls);
@@ -223,22 +222,185 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
             let Some(value) = selected_camera_menu_value(&state.descriptor, requested_index) else {
                 return;
             };
-            if state.value == value {
-                return;
-            }
-            state.value = value.clone();
-            control_commands_menu.set_control(state.descriptor.id.clone(), value.clone());
+            submit_camera_control_request(state, value, &control_commands_menu);
             let updated_controls = controls.clone();
             drop(controls);
             set_camera_control_model(&win, &updated_controls);
         });
 
     let control_commands_reset = Arc::clone(&control_commands);
+    let controls_reset = Arc::clone(&camera_controls);
     main_window
         .global::<AppState>()
         .on_reset_camera_controls(move || {
-            control_commands_reset.reset_controls();
+            let Ok(mut controls) = controls_reset.lock() else {
+                return;
+            };
+            let revisions = controls
+                .iter_mut()
+                .map(|state| {
+                    state.revision = state.revision.wrapping_add(1);
+                    (state.descriptor.id.clone(), state.revision)
+                })
+                .collect();
+            control_commands_reset.reset_controls(revisions);
         });
+}
+
+fn submit_camera_control_request(
+    state: &mut CameraControlRuntimeState,
+    value: CameraControlValue,
+    commands: &crate::camera_queue::ControlCommandMailbox,
+) {
+    state.value.clone_from(&value);
+    state.revision = state.revision.wrapping_add(1);
+    commands.set_control(state.descriptor.id.clone(), value, state.revision);
+}
+
+fn restore_camera_controls(
+    device: &mut dyn CameraDevice,
+    descriptors: &[CameraControlDescriptor],
+    saved_controls: &BTreeMap<String, SavedCameraControlValue>,
+) -> HashMap<CameraControlId, CameraControlValue> {
+    let mut restore_values = descriptors
+        .iter()
+        .filter_map(|descriptor| {
+            let saved = saved_controls.get(&camera_control_key(&descriptor.id))?;
+            Some((
+                descriptor,
+                compatible_saved_camera_control_value(descriptor, saved)?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let is_mode = |descriptor: &CameraControlDescriptor| {
+        matches!(
+            descriptor.kind,
+            CameraControlKind::Boolean { .. } | CameraControlKind::Menu { .. }
+        )
+    };
+    // Select manual modes before their values (required by some Linux drivers).
+    restore_values.sort_by_key(|(descriptor, _)| !is_mode(descriptor));
+    let mut applied = HashMap::new();
+    for (descriptor, value) in restore_values.iter().chain(
+        restore_values
+            .iter()
+            .filter(|(descriptor, _)| is_mode(descriptor)),
+    ) {
+        // Windows numeric properties force manual mode. Reapply saved modes
+        // last so an automatic mode remains authoritative after reopening.
+        if device.set_control_value(&descriptor.id, value).is_ok() {
+            applied.insert(descriptor.id.clone(), value.clone());
+        }
+    }
+    applied
+}
+
+fn related_camera_control(id: &CameraControlId) -> Option<CameraControlId> {
+    let CameraControlId::Standard(control) = id else {
+        return None;
+    };
+    let related = match control {
+        StandardCameraControl::Exposure => StandardCameraControl::ExposureMode,
+        StandardCameraControl::ExposureMode => StandardCameraControl::Exposure,
+        StandardCameraControl::WhiteBalanceManual => StandardCameraControl::WhiteBalanceAutomatic,
+        StandardCameraControl::WhiteBalanceAutomatic => StandardCameraControl::WhiteBalanceManual,
+        _ => return None,
+    };
+    Some(CameraControlId::Standard(related))
+}
+
+fn apply_camera_control_update(
+    device: &mut dyn CameraDevice,
+    confirmed: &mut [CameraControlRuntimeState],
+    id: &CameraControlId,
+    value: &CameraControlValue,
+    revision: u64,
+) -> (CameraResult<()>, Vec<CameraControlRuntimeState>) {
+    let result = device.set_control_value(id, value);
+    let related = related_camera_control(id);
+    let readbacks = confirmed
+        .iter_mut()
+        .filter(|state| {
+            state.descriptor.id == *id || related.as_ref() == Some(&state.descriptor.id)
+        })
+        .map(|state| {
+            state.value = device
+                .control_value(&state.descriptor.id)
+                .unwrap_or_else(|_| {
+                    if state.descriptor.id == *id && result.is_ok() {
+                        value.clone()
+                    } else {
+                        state.value.clone()
+                    }
+                });
+            if state.descriptor.id == *id {
+                state.revision = revision;
+            }
+            state.clone()
+        })
+        .collect();
+    (result, readbacks)
+}
+
+fn read_camera_controls_after_reset(
+    device: &dyn CameraDevice,
+    confirmed: &mut [CameraControlRuntimeState],
+    revisions: &HashMap<CameraControlId, u64>,
+    reset_succeeded: bool,
+) {
+    for state in confirmed {
+        state.value = device
+            .control_value(&state.descriptor.id)
+            .unwrap_or_else(|_| {
+                if reset_succeeded {
+                    default_camera_control_value(&state.descriptor.kind)
+                        .unwrap_or_else(|| state.value.clone())
+                } else {
+                    state.value.clone()
+                }
+            });
+        if let Some(revision) = revisions.get(&state.descriptor.id) {
+            state.revision = *revision;
+        }
+    }
+}
+
+fn publish_camera_control_readbacks(
+    window: &slint::Weak<MainWindow>,
+    current_controls: &Arc<Mutex<Vec<CameraControlRuntimeState>>>,
+    stream_generation: &Arc<AtomicU64>,
+    generation: u64,
+    readbacks: Vec<CameraControlRuntimeState>,
+) {
+    let updated = current_controls
+        .lock()
+        .ok()
+        .map(|mut controls| merge_camera_control_readbacks(&mut controls, &readbacks))
+        .unwrap_or_default();
+    if updated.is_empty() {
+        return;
+    }
+    let ui_generation = Arc::clone(stream_generation);
+    let current_controls = Arc::clone(current_controls);
+    let _ = window.upgrade_in_event_loop(move |win| {
+        if ui_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let Some(controls) = current_controls.lock().ok().map(|states| states.clone()) else {
+            return;
+        };
+        for index in updated {
+            if readbacks.iter().any(|readback| {
+                controls.get(index).is_some_and(|current| {
+                    current.descriptor.id == readback.descriptor.id
+                        && current.revision == readback.revision
+                        && current.value == readback.value
+                })
+            }) {
+                update_camera_control_row(&win, &controls, index);
+            }
+        }
+    });
 }
 
 pub(super) fn start_workers(
@@ -480,28 +642,8 @@ fn start_camera_worker(main_window: &MainWindow, runtime: &AppRuntime) -> thread
             };
             let descriptors = device.capabilities().controls.clone();
             let saved_controls = settings_snapshot(&settings_worker).camera_control_values;
-            let mut restore_values = descriptors
-                .iter()
-                .filter_map(|descriptor| {
-                    let saved = saved_controls.get(&camera_control_key(&descriptor.id))?;
-                    let value = compatible_saved_camera_control_value(descriptor, saved)?;
-                    Some((descriptor, value))
-                })
-                .collect::<Vec<_>>();
-            // Automatic/manual mode controls must be restored before their
-            // dependent numeric values (for example, manual exposure).
-            restore_values.sort_by_key(|(descriptor, _)| {
-                !matches!(
-                    descriptor.kind,
-                    CameraControlKind::Boolean { .. } | CameraControlKind::Menu { .. }
-                )
-            });
-            let mut applied_values = HashMap::new();
-            for (descriptor, value) in restore_values {
-                if device.set_control_value(&descriptor.id, &value).is_ok() {
-                    applied_values.insert(descriptor.id.clone(), value);
-                }
-            }
+            let applied_values =
+                restore_camera_controls(device.as_mut(), &descriptors, &saved_controls);
             let discovered_controls = descriptors
                 .into_iter()
                 .filter_map(|descriptor| {
@@ -515,6 +657,7 @@ fn start_camera_worker(main_window: &MainWindow, runtime: &AppRuntime) -> thread
                         key: camera_control_key(&descriptor.id),
                         descriptor,
                         value,
+                        revision: 0,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -627,31 +770,27 @@ fn start_camera_worker(main_window: &MainWindow, runtime: &AppRuntime) -> thread
                     let _ = device.stop_stream();
                     return;
                 }
-                if commands.reset {
-                    match device.reset_controls() {
+                if let Some(revisions) = commands.reset {
+                    let result = device.reset_controls();
+                    read_camera_controls_after_reset(
+                        device.as_ref(),
+                        &mut confirmed_controls,
+                        &revisions,
+                        result.is_ok(),
+                    );
+                    publish_camera_control_readbacks(
+                        &main_weak,
+                        &camera_controls_worker,
+                        &stream_generation_camera,
+                        generation,
+                        confirmed_controls.clone(),
+                    );
+                    match result {
                         Ok(()) => {
-                            for state in &mut confirmed_controls {
-                                state.value = device
-                                    .control_value(&state.descriptor.id)
-                                    .unwrap_or_else(|_| {
-                                        default_camera_control_value(&state.descriptor.kind)
-                                            .unwrap_or_else(|| state.value.clone())
-                                    });
-                            }
-                            if let Ok(mut controls) = camera_controls_worker.lock() {
-                                controls.clone_from(&confirmed_controls);
-                            }
                             if let Ok(mut guard) = settings_worker.lock() {
                                 guard.camera_control_values.clear();
                                 camera_settings_save_for_camera.mark_dirty();
                             }
-                            let controls = confirmed_controls.clone();
-                            let ui_generation = Arc::clone(&stream_generation_camera);
-                            let _ = main_weak.upgrade_in_event_loop(move |win| {
-                                if ui_generation.load(Ordering::Acquire) == generation {
-                                    set_camera_control_model(&win, &controls);
-                                }
-                            });
                         }
                         Err(error) => {
                             let message = format!(
@@ -663,59 +802,37 @@ fn start_camera_worker(main_window: &MainWindow, runtime: &AppRuntime) -> thread
                         }
                     }
                 }
-                for (id, value) in commands.updates {
-                    let Some(index) = confirmed_controls
+                for (id, value, revision) in commands.updates {
+                    if !confirmed_controls
                         .iter()
-                        .position(|state| state.descriptor.id == id)
-                    else {
+                        .any(|state| state.descriptor.id == id)
+                    {
                         continue;
-                    };
-                    let previous = confirmed_controls[index].value.clone();
-                    let result = device.set_control_value(&id, &value);
-                    let actual = device.control_value(&id).unwrap_or_else(|_| {
-                        if result.is_ok() {
-                            value.clone()
-                        } else {
-                            previous
-                        }
-                    });
+                    }
+                    let (result, readbacks) = apply_camera_control_update(
+                        device.as_mut(),
+                        &mut confirmed_controls,
+                        &id,
+                        &value,
+                        revision,
+                    );
                     if result.is_ok() {
-                        confirmed_controls[index].value = actual.clone();
-                        remember_camera_control_value(
-                            &settings_worker,
-                            &camera_settings_save_for_camera,
-                            &confirmed_controls[index].key,
-                            &actual,
-                        );
-                    }
-                    let updated_controls = if let Ok(mut controls) = camera_controls_worker.lock() {
-                        if let Some(state) = controls.get_mut(index)
-                            && state.descriptor.id == id
-                            && state.value == value
-                        {
-                            state.value = actual;
-                            Some(controls.clone())
-                        } else {
-                            None
+                        for state in &readbacks {
+                            remember_camera_control_value(
+                                &settings_worker,
+                                &camera_settings_save_for_camera,
+                                &state.key,
+                                &state.value,
+                            );
                         }
-                    } else {
-                        None
-                    };
-                    if let Some(controls) = updated_controls {
-                        let ui_generation = Arc::clone(&stream_generation_camera);
-                        let current_controls = Arc::clone(&camera_controls_worker);
-                        let _ = main_weak.upgrade_in_event_loop(move |win| {
-                            let still_current = current_controls.lock().ok().is_some_and(|state| {
-                                state
-                                    .get(index)
-                                    .is_some_and(|current| current.value == controls[index].value)
-                            });
-                            if ui_generation.load(Ordering::Acquire) == generation && still_current
-                            {
-                                update_camera_control_row(&win, &controls, index);
-                            }
-                        });
                     }
+                    publish_camera_control_readbacks(
+                        &main_weak,
+                        &camera_controls_worker,
+                        &stream_generation_camera,
+                        generation,
+                        readbacks,
+                    );
                     if let Err(error) = result {
                         let message = format!("Réglage caméra refusé : {error}");
                         let _ = main_weak.upgrade_in_event_loop(move |win| {
@@ -904,4 +1021,390 @@ fn start_camera_worker(main_window: &MainWindow, runtime: &AppRuntime) -> thread
             }
         }
     })
+}
+
+#[cfg(test)]
+mod control_restoration_tests {
+    use super::*;
+    use iriscope_core::camera::{
+        CameraBackendKind, CameraDescriptor, CameraDeviceId, CameraError, StreamConfiguration,
+    };
+    use iriscope_core::capabilities::{CameraCapabilities, CameraControlMenuItem};
+
+    struct ModeSwitchingCamera {
+        descriptor: CameraDescriptor,
+        capabilities: CameraCapabilities,
+        values: HashMap<CameraControlId, CameraControlValue>,
+        requires_manual: bool,
+    }
+
+    fn id(control: StandardCameraControl) -> CameraControlId {
+        CameraControlId::Standard(control)
+    }
+
+    impl ModeSwitchingCamera {
+        fn new(requires_manual: bool) -> Self {
+            let controls = [
+                (
+                    StandardCameraControl::WhiteBalanceAutomatic,
+                    CameraControlKind::Boolean { default: true },
+                ),
+                (
+                    StandardCameraControl::WhiteBalanceManual,
+                    CameraControlKind::Integer {
+                        minimum: 0,
+                        maximum: 100,
+                        step: 1,
+                        default: 10,
+                        unit: None,
+                    },
+                ),
+                (
+                    StandardCameraControl::ExposureMode,
+                    CameraControlKind::Menu {
+                        items: vec![
+                            CameraControlMenuItem {
+                                value: 1,
+                                label: "Automatic".to_owned(),
+                            },
+                            CameraControlMenuItem {
+                                value: 2,
+                                label: "Manual".to_owned(),
+                            },
+                        ],
+                        default: 1,
+                    },
+                ),
+                (
+                    StandardCameraControl::Exposure,
+                    CameraControlKind::Integer {
+                        minimum: 0,
+                        maximum: 100,
+                        step: 1,
+                        default: 10,
+                        unit: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(|(control, kind)| CameraControlDescriptor {
+                id: id(control),
+                name: format!("{control:?}"),
+                kind,
+                read_only: false,
+            })
+            .collect::<Vec<_>>();
+            let values = controls
+                .iter()
+                .map(|descriptor| {
+                    (
+                        descriptor.id.clone(),
+                        default_camera_control_value(&descriptor.kind).expect("default"),
+                    )
+                })
+                .collect();
+            Self {
+                descriptor: CameraDescriptor {
+                    id: CameraDeviceId::new("mock"),
+                    display_name: "Mock".to_owned(),
+                    backend: CameraBackendKind::MediaFoundation,
+                    usb: None,
+                },
+                capabilities: CameraCapabilities {
+                    controls,
+                    modes: Vec::new(),
+                },
+                values,
+                requires_manual,
+            }
+        }
+
+        fn states(&self) -> Vec<CameraControlRuntimeState> {
+            self.capabilities
+                .controls
+                .iter()
+                .map(|descriptor| CameraControlRuntimeState {
+                    key: camera_control_key(&descriptor.id),
+                    descriptor: descriptor.clone(),
+                    value: self.values[&descriptor.id].clone(),
+                    revision: 0,
+                })
+                .collect()
+        }
+    }
+
+    impl CameraDevice for ModeSwitchingCamera {
+        fn descriptor(&self) -> &CameraDescriptor {
+            &self.descriptor
+        }
+        fn capabilities(&self) -> &CameraCapabilities {
+            &self.capabilities
+        }
+        fn start_stream(&mut self, _: &StreamConfiguration) -> CameraResult<()> {
+            Ok(())
+        }
+        fn stop_stream(&mut self) -> CameraResult<()> {
+            Ok(())
+        }
+        fn next_event(&mut self, _: Duration) -> CameraResult<CameraEvent> {
+            Err(CameraError::new(CameraErrorKind::TimedOut, "no frames"))
+        }
+        fn control_value(&self, control_id: &CameraControlId) -> CameraResult<CameraControlValue> {
+            self.values
+                .get(control_id)
+                .cloned()
+                .ok_or_else(|| CameraError::new(CameraErrorKind::Unsupported, "unknown control"))
+        }
+        fn set_control_value(
+            &mut self,
+            control_id: &CameraControlId,
+            value: &CameraControlValue,
+        ) -> CameraResult<()> {
+            let manual_mode = match control_id {
+                CameraControlId::Standard(StandardCameraControl::WhiteBalanceManual) => Some((
+                    id(StandardCameraControl::WhiteBalanceAutomatic),
+                    CameraControlValue::Boolean(false),
+                )),
+                CameraControlId::Standard(StandardCameraControl::Exposure) => Some((
+                    id(StandardCameraControl::ExposureMode),
+                    CameraControlValue::Menu(2),
+                )),
+                _ => None,
+            };
+            if let Some((mode, manual)) = manual_mode {
+                if self.requires_manual && self.values.get(&mode) != Some(&manual) {
+                    return Err(CameraError::new(
+                        CameraErrorKind::Unsupported,
+                        "manual mode required",
+                    ));
+                }
+                // Like Windows, setting the numeric value changes its shared mode.
+                self.values.insert(mode, manual);
+            }
+            self.values.insert(control_id.clone(), value.clone());
+            Ok(())
+        }
+        fn reset_controls(&mut self) -> CameraResult<()> {
+            Ok(())
+        }
+    }
+
+    fn saved_controls(automatic: bool) -> BTreeMap<String, SavedCameraControlValue> {
+        [
+            (
+                StandardCameraControl::WhiteBalanceAutomatic,
+                SavedCameraControlValue::Boolean(automatic),
+            ),
+            (
+                StandardCameraControl::WhiteBalanceManual,
+                SavedCameraControlValue::Integer(42),
+            ),
+            (
+                StandardCameraControl::ExposureMode,
+                SavedCameraControlValue::Menu(if automatic { 1 } else { 2 }),
+            ),
+            (
+                StandardCameraControl::Exposure,
+                SavedCameraControlValue::Integer(71),
+            ),
+        ]
+        .into_iter()
+        .map(|(control, value)| (camera_control_key(&id(control)), value))
+        .collect()
+    }
+
+    #[test]
+    fn restored_automatic_modes_survive_windows_numeric_properties() {
+        let mut device = ModeSwitchingCamera::new(false);
+        let descriptors = device.capabilities.controls.clone();
+        restore_camera_controls(&mut device, &descriptors, &saved_controls(true));
+        assert_eq!(
+            device.values[&id(StandardCameraControl::Exposure)],
+            CameraControlValue::Integer(71)
+        );
+        assert_eq!(
+            device.values[&id(StandardCameraControl::WhiteBalanceManual)],
+            CameraControlValue::Integer(42)
+        );
+        assert_eq!(
+            device.values[&id(StandardCameraControl::ExposureMode)],
+            CameraControlValue::Menu(1)
+        );
+        assert_eq!(
+            device.values[&id(StandardCameraControl::WhiteBalanceAutomatic)],
+            CameraControlValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn restored_manual_modes_precede_linux_numeric_properties() {
+        let mut device = ModeSwitchingCamera::new(true);
+        let descriptors = device.capabilities.controls.clone();
+        restore_camera_controls(&mut device, &descriptors, &saved_controls(false));
+        assert_eq!(
+            device.values[&id(StandardCameraControl::Exposure)],
+            CameraControlValue::Integer(71)
+        );
+        assert_eq!(
+            device.values[&id(StandardCameraControl::WhiteBalanceManual)],
+            CameraControlValue::Integer(42)
+        );
+        assert_eq!(
+            device.values[&id(StandardCameraControl::ExposureMode)],
+            CameraControlValue::Menu(2)
+        );
+        assert_eq!(
+            device.values[&id(StandardCameraControl::WhiteBalanceAutomatic)],
+            CameraControlValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn numeric_readback_refreshes_automatic_mode_and_preserves_newer_requests() {
+        let mut device = ModeSwitchingCamera::new(false);
+        let mut confirmed = device.states();
+        let mut desired = confirmed.clone();
+        let white_balance = id(StandardCameraControl::WhiteBalanceManual);
+        let automatic = id(StandardCameraControl::WhiteBalanceAutomatic);
+        let numeric_index = desired
+            .iter()
+            .position(|state| state.descriptor.id == white_balance)
+            .expect("numeric");
+        let mode_index = desired
+            .iter()
+            .position(|state| state.descriptor.id == automatic)
+            .expect("mode");
+        desired[numeric_index].value = CameraControlValue::Integer(42);
+        desired[numeric_index].revision = 1;
+        let (result, readbacks) = apply_camera_control_update(
+            &mut device,
+            &mut confirmed,
+            &white_balance,
+            &CameraControlValue::Integer(42),
+            1,
+        );
+        result.expect("numeric update");
+        let mut current = desired.clone();
+        merge_camera_control_readbacks(&mut current, &readbacks);
+        assert_eq!(
+            current[mode_index].value,
+            CameraControlValue::Boolean(false)
+        );
+
+        // A new Auto request (even the same value as before) must win over this readback.
+        desired[mode_index].revision = 1;
+        desired[numeric_index].revision = 2;
+        desired[numeric_index].value = CameraControlValue::Integer(71);
+        assert!(merge_camera_control_readbacks(&mut desired, &readbacks).is_empty());
+        assert_eq!(desired[mode_index].value, CameraControlValue::Boolean(true));
+        assert_eq!(
+            desired[numeric_index].value,
+            CameraControlValue::Integer(71)
+        );
+        let (result, readbacks) = apply_camera_control_update(
+            &mut device,
+            &mut confirmed,
+            &automatic,
+            &CameraControlValue::Boolean(true),
+            1,
+        );
+        result.expect("automatic update");
+        merge_camera_control_readbacks(&mut desired, &readbacks);
+        assert_eq!(desired[mode_index].value, CameraControlValue::Boolean(true));
+        assert_eq!(
+            desired[numeric_index].value,
+            CameraControlValue::Integer(71)
+        );
+    }
+
+    #[test]
+    fn selecting_the_current_automatic_mode_after_a_numeric_request_keeps_auto() {
+        for (numeric, automatic, auto_value) in [
+            (
+                StandardCameraControl::WhiteBalanceManual,
+                StandardCameraControl::WhiteBalanceAutomatic,
+                CameraControlValue::Boolean(true),
+            ),
+            (
+                StandardCameraControl::Exposure,
+                StandardCameraControl::ExposureMode,
+                CameraControlValue::Menu(1),
+            ),
+        ] {
+            let mut device = ModeSwitchingCamera::new(false);
+            let mut confirmed = device.states();
+            let mut desired = confirmed.clone();
+            let commands = crate::camera_queue::ControlCommandMailbox::default();
+            let numeric_index = desired
+                .iter()
+                .position(|state| state.descriptor.id == id(numeric))
+                .expect("numeric");
+            let mode_index = desired
+                .iter()
+                .position(|state| state.descriptor.id == id(automatic))
+                .expect("mode");
+            submit_camera_control_request(
+                &mut desired[numeric_index],
+                CameraControlValue::Integer(71),
+                &commands,
+            );
+            // Popup selection is explicit even when its displayed value is already Auto.
+            assert_eq!(desired[mode_index].value, auto_value);
+            submit_camera_control_request(&mut desired[mode_index], auto_value.clone(), &commands);
+            let batch = commands.take();
+            assert_eq!(batch.updates.len(), 2);
+            for (control, value, revision) in batch.updates {
+                let (result, readbacks) = apply_camera_control_update(
+                    &mut device,
+                    &mut confirmed,
+                    &control,
+                    &value,
+                    revision,
+                );
+                result.expect("queued update");
+                merge_camera_control_readbacks(&mut desired, &readbacks);
+            }
+            assert_eq!(device.values[&id(automatic)], auto_value);
+            assert_eq!(desired[mode_index].value, auto_value);
+            assert_eq!(desired[mode_index].revision, 1);
+            assert_eq!(device.values[&id(numeric)], CameraControlValue::Integer(71));
+        }
+    }
+
+    #[test]
+    fn reset_readback_replaces_cancelled_requests_and_preserves_newer_slider_revision() {
+        let mut device = ModeSwitchingCamera::new(false);
+        let mut confirmed = device.states();
+        let mut desired = confirmed.clone();
+        let control = id(StandardCameraControl::Exposure);
+        let index = desired
+            .iter()
+            .position(|state| state.descriptor.id == control)
+            .expect("exposure");
+        desired[index].value = CameraControlValue::Integer(71);
+        // Revision 1 was cancelled by reset, which advances the UI request to 2.
+        desired[index].revision = 2;
+        let revisions = HashMap::from([(control.clone(), 2)]);
+        read_camera_controls_after_reset(&device, &mut confirmed, &revisions, true);
+        merge_camera_control_readbacks(&mut desired, &confirmed);
+        assert_eq!(desired[index].revision, 2);
+        assert_eq!(desired[index].value, CameraControlValue::Integer(10));
+
+        // A later slider request must survive even a delayed reset callback.
+        desired[index].revision = 3;
+        desired[index].value = CameraControlValue::Integer(71);
+        merge_camera_control_readbacks(&mut desired, &confirmed);
+        assert_eq!(desired[index].revision, 3);
+        assert_eq!(desired[index].value, CameraControlValue::Integer(71));
+        let (result, readbacks) = apply_camera_control_update(
+            &mut device,
+            &mut confirmed,
+            &control,
+            &CameraControlValue::Integer(71),
+            3,
+        );
+        result.expect("slider after reset");
+        assert!(merge_camera_control_readbacks(&mut desired, &readbacks).contains(&index));
+        assert_eq!(desired[index].value, CameraControlValue::Integer(71));
+    }
 }
