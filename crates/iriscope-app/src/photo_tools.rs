@@ -374,19 +374,20 @@ pub(super) fn display_settings(win: &MainWindow) -> DisplaySettings {
     clippy::cast_sign_loss
 )] // Inputs are bounded to ±100; output pixels are rounded and clamped to 0..255.
 pub(super) fn transform(mut image: image::RgbImage, settings: DisplaySettings) -> image::RgbImage {
-    let brightness = settings.brightness.clamp(-100, 100) as f32 * 1.5;
-    let contrast = 2.0_f32.powf(settings.contrast.clamp(-100, 100) as f32 / 100.0);
-    for value in image.as_mut() {
-        *value = ((f32::from(*value) - 127.5) * contrast + 127.5 + brightness)
-            .round()
-            .clamp(0.0, 255.0) as u8;
+    if settings.brightness != 0 || settings.contrast != 0 {
+        let brightness = settings.brightness.clamp(-100, 100) as f32 * 1.5;
+        let contrast = 2.0_f32.powf(settings.contrast.clamp(-100, 100) as f32 / 100.0);
+        for value in image.as_mut() {
+            *value = ((f32::from(*value) - 127.5) * contrast + 127.5 + brightness)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
     }
-    let image = iriscope_imaging::rotate_rgb(image, settings.rotation);
+    let mut image = iriscope_imaging::rotate_rgb(image, settings.rotation);
     if settings.mirror {
-        image::imageops::flip_horizontal(&image)
-    } else {
-        image
+        image::imageops::flip_horizontal_in_place(&mut image);
     }
+    image
 }
 pub(super) fn projected_review(
     review: &PhotoReview,
@@ -706,6 +707,57 @@ pub(super) fn install(window: &MainWindow, runtime: &AppRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn optimized_display_transform_preserves_all_channel_values_and_combined_effects() {
+        fn reference(mut image: image::RgbImage, settings: DisplaySettings) -> image::RgbImage {
+            let brightness = settings.brightness.clamp(-100, 100) as f32 * 1.5;
+            let contrast = 2.0_f32.powf(settings.contrast.clamp(-100, 100) as f32 / 100.0);
+            for value in image.as_mut() {
+                *value = ((f32::from(*value) - 127.5) * contrast + 127.5 + brightness)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            let image = iriscope_imaging::rotate_rgb(image, settings.rotation);
+            if settings.mirror {
+                image::imageops::flip_horizontal(&image)
+            } else {
+                image
+            }
+        }
+
+        let source = image::RgbImage::from_raw(
+            16,
+            16,
+            (0_u8..=255)
+                .flat_map(|value| [value, value.wrapping_add(73), 255 - value])
+                .collect(),
+        )
+        .expect("all RGB channel values");
+        for (brightness, contrast) in [(0, 0), (50, 100), (-100, -100), (150, -150)] {
+            for rotation in [0, 37, 90, 180, 270] {
+                for mirror in [false, true] {
+                    let settings = DisplaySettings {
+                        brightness,
+                        contrast,
+                        rotation,
+                        mirror,
+                    };
+                    assert_eq!(
+                        transform(source.clone(), settings),
+                        reference(source.clone(), settings),
+                        "brightness={brightness}, contrast={contrast}, rotation={rotation}, mirror={mirror}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn display_transform_rotates_and_mirrors_without_mutating_source() {
         let original = image::RgbImage::from_raw(2, 1, vec![10, 20, 30, 200, 210, 220]).unwrap();

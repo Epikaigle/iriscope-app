@@ -9,7 +9,7 @@
 | macOS Intel | Composant USB vidéo/bouton/réglages et service autorisé inclus dans le paquet ; AVFoundation disponible séparément | Chemin direct validé sur macOS 15.7.7, dont quatre appuis réels le 8 octobre ; ouverture USB ordinaire refusée (`0xe00002c5`) |
 | macOS Apple Silicon | Code disponible ; aucun paquet dans la release actuelle | Aucun essai matériel documenté |
 
-La [release 0.4.3](RELEASE-0.4.3.md) contient deux installateurs : Linux amd64
+La [release 0.4.4](RELEASE-0.4.4.md) contient deux installateurs : Linux amd64
 `.deb` et macOS Intel `.dmg`. Windows et Apple Silicon ne sont pas publiés.
 
 Le bouton de capture à l'écran et les raccourcis utilisent le même traitement photo/vidéo sur les trois systèmes. Ce traitement est distinct de la réception du bouton matériel.

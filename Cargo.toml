@@ -12,7 +12,7 @@ default-members = ["crates/iriscope-app"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.89"
 
@@ -22,6 +22,12 @@ unsafe_op_in_unsafe_fn = "warn"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# Keep speed-oriented optimizations and unwinding for worker error handling.
+# Symbols are useful for development, but do not need to ship in installers.
+[profile.release]
+opt-level = 3
+strip = "symbols"
 
 # The live MJPEG preview runs through zune-jpeg even during `cargo run`.
 # Without this override, decoding a DE400 frame in a debug build can take

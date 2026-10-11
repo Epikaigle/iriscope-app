@@ -565,7 +565,7 @@ l’empreinte du binaire fourni et la disponibilité du moteur MP4. Les scripts
 refusent un binaire dont `--version` ne correspond pas au manifeste. Les paramètres
 et captures restent hors des fichiers installés ; les identifiants des installateurs
 restent constants lors d’une mise à jour. Les instructions sont dans
-[documentation/RELEASE-0.4.3.md](documentation/RELEASE-0.4.3.md).
+[documentation/RELEASE-0.4.4.md](documentation/RELEASE-0.4.4.md).
 
 Pour inclure un FFmpeg autonome construit pour le système cible, les deux scripts
 acceptent `--ffmpeg chemin/ffmpeg` et `--ffmpeg-license chemin/COPYING.txt`.
@@ -583,6 +583,10 @@ cargo run --release -p iriscope-app
 
 Le profil de développement optimise également les crates de décodage d'image,
 mais le profil `release` reste la référence pour les mesures de performance.
+Les installateurs retirent les symboles de compilation pour réduire leur taille,
+tout en conservant les optimisations de vitesse et le traitement des erreurs des
+tâches de fond. Les mesures et leurs limites sont dans
+[documentation/PERFORMANCE.md](documentation/PERFORMANCE.md).
 
 Sous Linux, installer FFmpeg et `ffprobe` pour les tests réels d’export, ainsi que
 Xvfb pour les interactions graphiques. Les tests des paquets se lancent avec
