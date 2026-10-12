@@ -1,14 +1,14 @@
 //! Image decoding and processing for `IrisScope`.
 
 mod rotation;
-pub use rotation::{RotationGeometry, rotate_rgb};
+pub use rotation::{RotationGeometry, rotate_rgb, transform_rgb_to_buffer};
 
 use std::{error::Error, fmt};
 
 use image::{ColorType, ImageEncoder, imageops::FilterType};
 use zune_jpeg::{
     JpegDecoder,
-    zune_core::{bytestream::ZCursor, colorspace::ColorSpace},
+    zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions},
 };
 
 /// Error produced during image decoding or processing.
@@ -156,8 +156,78 @@ pub fn ensure_jpeg_has_dht(jpeg_data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// # Errors
 ///
 /// Returns an [`ImagingError::JpegDecode`] if the JPEG bitstream is invalid or corrupted.
-#[allow(clippy::match_same_arms)]
 pub fn decode_mjpeg_to_rgb8(jpeg_data: &[u8]) -> Result<(u32, u32, Vec<u8>), ImagingError> {
+    decode_mjpeg_to_buffer(jpeg_data, |width, height| {
+        vec![0; width as usize * height as usize * 3]
+    })
+}
+
+/// Decodes MJPEG directly into an RGB8 buffer allocated by the caller.
+///
+/// The allocator runs only after validating the encoded size and image dimensions.
+/// Its buffer must contain exactly `width * height * 3` bytes. This allows display
+/// buffers to receive decoded pixels without an intermediate RGB allocation/copy.
+///
+/// # Errors
+///
+/// Returns [`ImagingError::JpegDecode`] for invalid or oversized JPEG data, or
+/// [`ImagingError::InvalidBufferSize`] if the allocated buffer has the wrong length.
+pub fn decode_mjpeg_to_buffer<B: AsMut<[u8]>>(
+    jpeg_data: &[u8],
+    allocate: impl FnOnce(u32, u32) -> B,
+) -> Result<(u32, u32, B), ImagingError> {
+    let mut destination = AllocatedRgb {
+        allocate: Some(allocate),
+        buffer: None,
+    };
+    let (width, height) = decode_mjpeg_into(jpeg_data, &mut destination)?;
+    let buffer = destination.buffer.ok_or(ImagingError::InvalidBufferSize)?;
+    Ok((width, height, buffer))
+}
+
+trait RgbDestination {
+    fn pixels(&mut self, width: u32, height: u32) -> &mut [u8];
+}
+
+// A private reader type keeps JPEG generic code instantiated in this optimized
+// crate. Sharing ZCursor<&[u8]> with unoptimized image dependencies can otherwise
+// select their slower generic implementations in development builds.
+struct MjpegBytes<'a>(&'a [u8]);
+
+impl AsRef<[u8]> for MjpegBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+struct AllocatedRgb<B, F> {
+    allocate: Option<F>,
+    buffer: Option<B>,
+}
+
+impl<B: AsMut<[u8]>, F: FnOnce(u32, u32) -> B> RgbDestination for AllocatedRgb<B, F> {
+    fn pixels(&mut self, width: u32, height: u32) -> &mut [u8] {
+        let allocate = self
+            .allocate
+            .take()
+            .expect("RGB destination allocated once");
+        self.buffer = Some(allocate(width, height));
+        self.buffer
+            .as_mut()
+            .expect("RGB destination allocated")
+            .as_mut()
+    }
+}
+
+// Keep the entire JPEG decoder monomorphization in iriscope-imaging, whose
+// development profile is optimized. A generic decoder body instantiated by the
+// unoptimized app crate can otherwise make `cargo run` decode ten times slower.
+// Only destination allocation crosses the dynamic boundary, once per image.
+#[inline(never)]
+fn decode_mjpeg_into(
+    jpeg_data: &[u8],
+    destination: &mut dyn RgbDestination,
+) -> Result<(u32, u32), ImagingError> {
     if jpeg_data.len() > MAX_ENCODED_IMAGE_BYTES {
         return Err(ImagingError::JpegDecode(
             "JPEG input exceeds the 32 MiB limit".to_string(),
@@ -165,7 +235,9 @@ pub fn decode_mjpeg_to_rgb8(jpeg_data: &[u8]) -> Result<(u32, u32, Vec<u8>), Ima
     }
     let patched_data = ensure_jpeg_has_dht(jpeg_data);
 
-    let mut decoder = JpegDecoder::new(ZCursor::new(patched_data.as_ref()));
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut decoder =
+        JpegDecoder::new_with_options(ZCursor::new(MjpegBytes(patched_data.as_ref())), options);
     decoder
         .decode_headers()
         .map_err(|err| ImagingError::JpegDecode(format!("{err:?}")))?;
@@ -179,31 +251,20 @@ pub fn decode_mjpeg_to_rgb8(jpeg_data: &[u8]) -> Result<(u32, u32, Vec<u8>), Ima
             "JPEG dimensions exceed the 8192-pixel or 16 megapixel limit".to_string(),
         ));
     }
-    let pixels = decoder
-        .decode()
+    let expected = image_pixel_count(width, height)? * 3;
+    if decoder.output_colorspace() != Some(ColorSpace::RGB)
+        || decoder.output_buffer_size() != Some(expected)
+    {
+        return Err(ImagingError::InvalidBufferSize);
+    }
+    let pixels = destination.pixels(width, height);
+    if pixels.len() != expected {
+        return Err(ImagingError::InvalidBufferSize);
+    }
+    decoder
+        .decode_into(pixels)
         .map_err(|err| ImagingError::JpegDecode(format!("{err:?}")))?;
-
-    // Ensure output is RGB8
-    let rgb_bytes = match decoder.output_colorspace() {
-        Some(ColorSpace::RGB) | None => pixels,
-        Some(ColorSpace::BGR) => {
-            let mut rgb = pixels;
-            for chunk in rgb.chunks_exact_mut(3) {
-                chunk.swap(0, 2);
-            }
-            rgb
-        }
-        Some(ColorSpace::RGBA) => {
-            let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-            for chunk in pixels.chunks_exact(4) {
-                rgb.extend_from_slice(&chunk[..3]);
-            }
-            rgb
-        }
-        _ => pixels,
-    };
-
-    Ok((width, height, rgb_bytes))
+    Ok((width, height))
 }
 
 /// Decodes a supported still-image file (JPEG or PNG) into RGB8.
@@ -506,8 +567,9 @@ mod tests {
 
     use super::{
         ImagingError, apply_transforms, convert_bgra8_to_rgb8, convert_nv12_to_rgb8,
-        convert_yuyv_to_rgb8, create_thumbnail_jpeg, decode_image_to_rgb8, decode_mjpeg_to_rgb8,
-        decode_reference_image_to_rgb8, encode_rgb8_jpeg, ensure_jpeg_has_dht, resize_rgb8_to_fit,
+        convert_yuyv_to_rgb8, create_thumbnail_jpeg, decode_image_to_rgb8, decode_mjpeg_to_buffer,
+        decode_mjpeg_to_rgb8, decode_reference_image_to_rgb8, encode_rgb8_jpeg,
+        ensure_jpeg_has_dht, resize_rgb8_to_fit,
     };
 
     fn jpeg_without_dht(jpeg: &[u8]) -> Vec<u8> {
@@ -545,6 +607,97 @@ mod tests {
             decode_mjpeg_to_rgb8(&stripped).unwrap(),
             decode_mjpeg_to_rgb8(&jpeg).unwrap()
         );
+    }
+
+    #[test]
+    fn direct_mjpeg_decode_matches_owned_decoder_for_color_gray_and_missing_dht() {
+        use image::ColorType;
+        use zune_jpeg::{
+            JpegDecoder,
+            zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions},
+        };
+
+        let rgb = (0_u8..=255).cycle().take(17 * 13 * 3).collect::<Vec<_>>();
+        let color = encode_rgb8_jpeg(&rgb, 17, 13, 95).unwrap();
+        let mut gray = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut gray, 95)
+            .encode(&rgb[..17 * 13], 17, 13, ColorType::L8.into())
+            .unwrap();
+        for jpeg in [&color, &gray, &jpeg_without_dht(&color)] {
+            let patched = ensure_jpeg_has_dht(jpeg);
+            let mut reference = JpegDecoder::new_with_options(
+                ZCursor::new(patched.as_ref()),
+                DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB),
+            );
+            let expected = reference.decode().unwrap();
+            let (width, height, output) = decode_mjpeg_to_buffer(jpeg, |width, height| {
+                vec![0; width as usize * height as usize * 3].into_boxed_slice()
+            })
+            .unwrap();
+            assert_eq!((width, height), (17, 13));
+            assert_eq!(output.as_ref(), expected.as_slice());
+            assert_eq!(decode_mjpeg_to_rgb8(jpeg).unwrap().2, expected);
+            if std::ptr::eq(jpeg, &raw const gray) {
+                assert!(output.chunks_exact(3).all(|p| p[0] == p[1] && p[1] == p[2]));
+            }
+        }
+    }
+
+    #[test]
+    fn direct_mjpeg_decode_rejects_invalid_allocations_and_bounds() {
+        let jpeg = encode_rgb8_jpeg(&[42; 12], 2, 2, 80).unwrap();
+        for length in [0, 11, 13] {
+            assert!(matches!(
+                decode_mjpeg_to_buffer(&jpeg, |_, _| vec![0; length]),
+                Err(ImagingError::InvalidBufferSize)
+            ));
+        }
+        let sof = jpeg
+            .windows(2)
+            .position(|bytes| bytes == [0xFF, 0xC0])
+            .unwrap();
+        for (width, height) in [(8193_u16, 1_u16), (4001, 4000)] {
+            let mut oversized = jpeg.clone();
+            oversized[sof + 5..sof + 7].copy_from_slice(&height.to_be_bytes());
+            oversized[sof + 7..sof + 9].copy_from_slice(&width.to_be_bytes());
+            assert!(
+                decode_mjpeg_to_buffer(&oversized, |_, _| -> Vec<u8> {
+                    panic!("Oversized JPEG must be rejected before allocation")
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            decode_mjpeg_to_buffer(b"invalid JPEG", |_, _| -> Vec<u8> {
+                panic!("Invalid header must be rejected before allocation")
+            })
+            .is_err()
+        );
+        assert!(
+            decode_mjpeg_to_buffer(
+                &vec![0; super::MAX_ENCODED_IMAGE_BYTES + 1],
+                |_, _| -> Vec<u8> { panic!("Oversized input must be rejected before allocation") }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn direct_mjpeg_decode_allocates_once_after_reading_dimensions() {
+        let jpeg = encode_rgb8_jpeg(&[42; 12], 2, 2, 80).unwrap();
+        let allocations = std::cell::Cell::new(0);
+        let count = &allocations;
+        let destination = vec![0_u8; 12].into_boxed_slice();
+        let (width, height, pixels) = decode_mjpeg_to_buffer(&jpeg, move |width, height| {
+            count.set(count.get() + 1);
+            assert_eq!((width, height), (2, 2));
+            destination
+        })
+        .unwrap();
+        assert_eq!(allocations.get(), 1);
+        assert_eq!((width, height), (2, 2));
+        let expected = decode_mjpeg_to_rgb8(&jpeg).unwrap().2;
+        assert_eq!(pixels.as_ref(), expected.as_slice());
     }
 
     #[test]

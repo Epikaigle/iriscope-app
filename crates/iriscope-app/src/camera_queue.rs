@@ -1,13 +1,14 @@
-use crate::app_helpers::{persist_settings, settings_error};
+use crate::app_helpers::{decode_camera_frame_to_rgb8, persist_settings, settings_error};
 use crate::config::NOTICE_ERROR;
 use crate::playback::show_capture_notice;
 use crate::ui::MainWindow;
 use iriscope_core::camera::CapturedFrame;
-use iriscope_core::capabilities::{CameraControlId, CameraControlValue};
+use iriscope_core::capabilities::{CameraControlId, CameraControlValue, PixelFormat};
 use iriscope_core::settings::AppSettings;
+use slint::{Rgb8Pixel, SharedPixelBuffer};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 #[derive(Default)]
@@ -280,7 +281,7 @@ pub(super) struct DecodeMailboxState {
 #[derive(Debug)]
 pub(super) struct QueuedDecodeFrame {
     pub(super) generation: u64,
-    pub(super) frame: CapturedFrame,
+    pub(super) frame: Arc<SharedCameraFrame>,
 }
 
 impl QueuedDecodeFrame {
@@ -289,8 +290,93 @@ impl QueuedDecodeFrame {
     }
 }
 
+impl Drop for QueuedDecodeFrame {
+    fn drop(&mut self) {
+        // Replaced, hidden, stale and closed preview jobs must not retain RGB
+        // images in the recording queue. Only the validation bit remains there.
+        let mut preview = self
+            .frame
+            .preview
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        preview.requested = false;
+        preview.pixels = None;
+    }
+}
+
+type DecodedCameraFrame = SharedPixelBuffer<Rgb8Pixel>;
+
+/// Shares MJPEG validation between recording and the latest-frame preview.
+/// Native bytes remain immutable and recording retains at most one RGB image
+/// for each outstanding preview job, never one for every queued video frame.
+#[derive(Debug)]
+pub(super) struct SharedCameraFrame {
+    pub(super) frame: CapturedFrame,
+    mjpeg_valid: OnceLock<bool>,
+    preview: Mutex<PreviewPixels>,
+}
+
+#[derive(Debug, Default)]
+struct PreviewPixels {
+    requested: bool,
+    pixels: Option<DecodedCameraFrame>,
+}
+
+impl SharedCameraFrame {
+    pub(super) fn new(frame: CapturedFrame) -> Self {
+        Self {
+            frame,
+            mjpeg_valid: OnceLock::new(),
+            preview: Mutex::new(PreviewPixels::default()),
+        }
+    }
+
+    pub(super) fn decode_for_preview(&self) -> Option<DecodedCameraFrame> {
+        if self.frame.pixel_format != PixelFormat::Mjpeg {
+            return decode_camera_frame_to_rgb8(&self.frame).map(|(width, height, rgb)| {
+                SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(&rgb, width, height)
+            });
+        }
+        if !self.validate_mjpeg() {
+            return None;
+        }
+        self.preview
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pixels
+            .take()
+    }
+
+    pub(super) fn validate_mjpeg(&self) -> bool {
+        self.validate_mjpeg_with(|| crate::pixel_buffer::decode_mjpeg_pixels(&self.frame.data).ok())
+    }
+
+    fn validate_mjpeg_with(&self, decode: impl FnOnce() -> Option<DecodedCameraFrame>) -> bool {
+        *self.mjpeg_valid.get_or_init(|| {
+            // OnceLock lets the other worker reuse the result, including failed
+            // validation, and permits retry if a decoder unwinds. No camera or
+            // mailbox lock is held during decoding or while waiting for it.
+            let decoded = decode();
+            let valid = decoded.is_some();
+            let mut preview = self
+                .preview
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if preview.requested {
+                preview.pixels = decoded;
+            }
+            valid
+        })
+    }
+}
+
 impl DecodeMailbox {
+    #[cfg(test)]
     pub(super) fn publish(&self, generation: u64, frame: CapturedFrame) -> bool {
+        self.publish_shared(generation, Arc::new(SharedCameraFrame::new(frame)))
+    }
+
+    pub(super) fn publish_shared(&self, generation: u64, frame: Arc<SharedCameraFrame>) -> bool {
         let mut state = self
             .state
             .lock()
@@ -298,6 +384,11 @@ impl DecodeMailbox {
         if state.closed {
             return false;
         }
+        frame
+            .preview
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .requested = true;
         let replaced = state
             .frame
             .replace(QueuedDecodeFrame { generation, frame })
@@ -335,5 +426,336 @@ impl DecodeMailbox {
         state.closed = true;
         state.frame = None;
         self.ready.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod shared_camera_tests {
+    use super::{DecodeMailbox, SharedCameraFrame};
+    use iriscope_core::{
+        camera::CapturedFrame,
+        capabilities::{PixelFormat, Resolution},
+    };
+    use slint::{Rgb8Pixel, SharedPixelBuffer};
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize};
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    fn jpeg_frame() -> CapturedFrame {
+        CapturedFrame {
+            sequence_number: 7,
+            timestamp: Duration::from_millis(120),
+            pixel_format: PixelFormat::Mjpeg,
+            // Native metadata can differ from JPEG dimensions; validation and
+            // the preview continue to use the decoder's actual dimensions.
+            resolution: Resolution::new(640, 480),
+            data: iriscope_imaging::encode_rgb8_jpeg(&[19; 16 * 12 * 3], 16, 12, 95)
+                .expect("JPEG fixture")
+                .into(),
+        }
+    }
+
+    #[test]
+    fn preview_then_recording_reuses_validation_without_retaining_rgb() {
+        let mailbox = DecodeMailbox::default();
+        let shared = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(1, Arc::clone(&shared));
+        let job = mailbox.receive().unwrap();
+        let preview = job.frame.decode_for_preview().unwrap();
+        assert_eq!((preview.width(), preview.height()), (16, 12));
+        assert!(shared.validate_mjpeg_with(|| panic!("must reuse JPEG validation")));
+        assert!(shared.preview.lock().unwrap().pixels.is_none());
+        drop(job);
+        assert!(!shared.preview.lock().unwrap().requested);
+        assert_eq!(shared.frame.sequence_number, 7);
+    }
+
+    #[test]
+    fn recording_then_preview_reuses_the_same_rgb_allocation() {
+        let mailbox = DecodeMailbox::default();
+        let shared = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(1, Arc::clone(&shared));
+        assert!(shared.validate_mjpeg());
+        let cached_pointer = shared
+            .preview
+            .lock()
+            .unwrap()
+            .pixels
+            .as_ref()
+            .unwrap()
+            .as_bytes()
+            .as_ptr();
+        let job = mailbox.receive().unwrap();
+        let preview = job.frame.decode_for_preview().unwrap();
+        assert_eq!(preview.as_bytes().as_ptr(), cached_pointer);
+        assert!(shared.preview.lock().unwrap().pixels.is_none());
+    }
+
+    #[test]
+    fn concurrent_validation_decodes_only_once() {
+        let mailbox = DecodeMailbox::default();
+        let shared = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(1, Arc::clone(&shared));
+        let calls = AtomicUsize::new(0);
+        let start = Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    start.wait();
+                    assert!(shared.validate_mjpeg_with(|| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        Some(SharedPixelBuffer::<Rgb8Pixel>::new(16, 12))
+                    }));
+                });
+            }
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(
+            mailbox
+                .receive()
+                .unwrap()
+                .frame
+                .decode_for_preview()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn invalid_jpeg_is_rejected_by_both_workers_and_failure_is_shared() {
+        let mailbox = DecodeMailbox::default();
+        let mut native = jpeg_frame();
+        native.data = Arc::from([0xff, 0xd8, 0xff, 0xd9]);
+        let shared = Arc::new(SharedCameraFrame::new(native));
+        mailbox.publish_shared(1, Arc::clone(&shared));
+        assert!(!shared.validate_mjpeg());
+        assert!(
+            mailbox
+                .receive()
+                .unwrap()
+                .frame
+                .decode_for_preview()
+                .is_none()
+        );
+        assert!(!shared.validate_mjpeg_with(|| panic!("must reuse failed validation")));
+        assert!(shared.preview.lock().unwrap().pixels.is_none());
+    }
+
+    #[test]
+    fn replacement_reconnect_and_close_release_cached_rgb() {
+        let mailbox = DecodeMailbox::default();
+        let first = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(1, Arc::clone(&first));
+        assert!(first.validate_mjpeg());
+        assert!(first.preview.lock().unwrap().pixels.is_some());
+        let second = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        assert!(mailbox.publish_shared(2, Arc::clone(&second)));
+        assert!(first.preview.lock().unwrap().pixels.is_none());
+        assert!(first.validate_mjpeg_with(|| panic!("retain validation only")));
+        assert!(second.validate_mjpeg());
+        let job = mailbox.receive().unwrap();
+        assert!(!job.is_current(&std::sync::atomic::AtomicU64::new(3)));
+        drop(job);
+        assert!(second.preview.lock().unwrap().pixels.is_none());
+
+        let third = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(3, Arc::clone(&third));
+        assert!(third.validate_mjpeg());
+        mailbox.close();
+        assert!(third.preview.lock().unwrap().pixels.is_none());
+        assert!(mailbox.receive().is_none());
+    }
+
+    #[test]
+    fn recording_without_preview_keeps_validation_only() {
+        let shared = SharedCameraFrame::new(jpeg_frame());
+        assert!(shared.validate_mjpeg());
+        assert!(shared.preview.lock().unwrap().pixels.is_none());
+        assert!(shared.validate_mjpeg_with(|| panic!("must reuse validation")));
+    }
+
+    #[test]
+    fn queued_recordings_retain_rgb_only_for_pending_and_in_flight_preview_jobs() {
+        let mailbox = DecodeMailbox::default();
+        let mut recordings = Vec::new();
+        let first = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(1, Arc::clone(&first));
+        let in_flight = mailbox.receive().unwrap();
+        assert!(first.validate_mjpeg());
+        recordings.push(first);
+
+        // Recording may still own old native frames after the preview skipped
+        // them. Even a long retained burst must keep only two RGB buffers:
+        // the in-flight preview and the latest pending preview.
+        for _ in 0..128 {
+            let shared = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+            mailbox.publish_shared(1, Arc::clone(&shared));
+            assert!(shared.validate_mjpeg());
+            recordings.push(shared);
+            assert_eq!(
+                recordings
+                    .iter()
+                    .filter(|frame| frame.preview.lock().unwrap().pixels.is_some())
+                    .count(),
+                2
+            );
+        }
+
+        drop(in_flight);
+        mailbox.clear();
+        for frame in recordings {
+            let preview = frame.preview.lock().unwrap();
+            assert!(!preview.requested);
+            assert!(preview.pixels.is_none());
+            drop(preview);
+            assert!(frame.validate_mjpeg_with(|| panic!("only validation must survive")));
+        }
+    }
+
+    #[test]
+    fn replacing_preview_while_recording_decodes_does_not_retain_stale_rgb() {
+        let mailbox = DecodeMailbox::default();
+        let shared = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(1, Arc::clone(&shared));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let recording_frame = Arc::clone(&shared);
+            let worker = scope.spawn(move || {
+                recording_frame.validate_mjpeg_with(|| {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    Some(SharedPixelBuffer::<Rgb8Pixel>::new(16, 12))
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let replacement = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+            let replaced = mailbox.publish_shared(2, replacement);
+            finish_tx.send(()).unwrap();
+            assert!(worker.join().unwrap());
+            assert!(replaced);
+        });
+
+        assert!(shared.validate_mjpeg_with(|| panic!("validation stays shared")));
+        let preview = shared.preview.lock().unwrap();
+        assert!(!preview.requested);
+        assert!(preview.pixels.is_none());
+    }
+
+    #[test]
+    fn closing_preview_while_recording_decodes_discards_rgb_without_losing_validation() {
+        let mailbox = DecodeMailbox::default();
+        let shared = Arc::new(SharedCameraFrame::new(jpeg_frame()));
+        mailbox.publish_shared(1, Arc::clone(&shared));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let recording_frame = Arc::clone(&shared);
+            let worker = scope.spawn(move || {
+                recording_frame.validate_mjpeg_with(|| {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    Some(SharedPixelBuffer::<Rgb8Pixel>::new(16, 12))
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            mailbox.close();
+            finish_tx.send(()).unwrap();
+            assert!(worker.join().unwrap());
+        });
+
+        assert!(mailbox.receive().is_none());
+        assert!(shared.validate_mjpeg_with(|| panic!("recording validation survives close")));
+        let preview = shared.preview.lock().unwrap();
+        assert!(!preview.requested);
+        assert!(preview.pixels.is_none());
+    }
+
+    #[test]
+    fn decoder_unwind_does_not_leave_shared_validation_blocked() {
+        let shared = SharedCameraFrame::new(jpeg_frame());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shared.validate_mjpeg_with(|| panic!("decoder failure"))
+            }))
+            .is_err()
+        );
+        assert!(shared.validate_mjpeg());
+    }
+
+    #[test]
+    fn non_mjpeg_preview_keeps_native_conversion() {
+        let mut native = jpeg_frame();
+        native.pixel_format = PixelFormat::Bgra8;
+        native.resolution = Resolution::new(1, 1);
+        native.data = Arc::from([15, 25, 35, 255]);
+        let shared = SharedCameraFrame::new(native);
+        let pixels = shared.decode_for_preview().unwrap();
+        assert_eq!(pixels.as_bytes(), [35, 25, 15]);
+        assert!(shared.mjpeg_valid.get().is_none());
+    }
+
+    #[test]
+    #[ignore = "manual synthetic performance measurement"]
+    fn shared_camera_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        let (width, height) = (1280_u32, 1024_u32);
+        let mut state = 0x1234_5678_u32;
+        let rgb = (0..width * height * 3)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                state.to_be_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let mut native = jpeg_frame();
+        native.resolution = Resolution::new(width, height);
+        native.data = iriscope_imaging::encode_rgb8_jpeg(&rgb, width, height, 95)
+            .unwrap()
+            .into();
+        drop(rgb);
+        let iterations = 40;
+        let mut baseline = Vec::new();
+        let mut preview_first = Vec::new();
+        let mut recording_first = Vec::new();
+        for round in 0..3 {
+            for mode in [0, 1, 2].into_iter().cycle().skip(round).take(3) {
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    if mode == 0 {
+                        let (decoded_width, decoded_height, rgb) =
+                            iriscope_imaging::decode_mjpeg_to_rgb8(&native.data).unwrap();
+                        black_box(SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(
+                            &rgb,
+                            decoded_width,
+                            decoded_height,
+                        ));
+                        black_box(iriscope_imaging::decode_mjpeg_to_rgb8(&native.data).unwrap());
+                    } else {
+                        let shared = Arc::new(SharedCameraFrame::new(native.clone()));
+                        let mailbox = DecodeMailbox::default();
+                        mailbox.publish_shared(1, Arc::clone(&shared));
+                        let job = mailbox.receive().unwrap();
+                        if mode == 1 {
+                            black_box(job.frame.decode_for_preview().unwrap());
+                            assert!(shared.validate_mjpeg());
+                        } else {
+                            assert!(shared.validate_mjpeg());
+                            black_box(job.frame.decode_for_preview().unwrap());
+                        }
+                    }
+                }
+                let millis = started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations);
+                match mode {
+                    0 => baseline.push(millis),
+                    1 => preview_first.push(millis),
+                    _ => recording_first.push(millis),
+                }
+            }
+        }
+        eprintln!(
+            "MJPEG {width}x{height}, {} bytes, {iterations} frames/round; ms/frame baseline={baseline:?}, shared preview first={preview_first:?}, shared recording first={recording_first:?}",
+            native.data.len()
+        );
     }
 }

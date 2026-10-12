@@ -31,6 +31,7 @@ mod patient_ui;
 mod photo_export;
 mod photo_tools;
 mod photo_worker;
+mod pixel_buffer;
 mod playback;
 mod recording_worker;
 mod reference_worker;
@@ -47,4 +48,4 @@ mod workflow_controller;
 
 pub use diagnostic::run_diagnose;
 pub use gui::run_gui;
-pub use hardware_validation::run_hardware_validation;
+pub use hardware_validation::{run_camera_profile, run_hardware_validation};

@@ -29,6 +29,8 @@ struct Validation {
     phase: u8,
     started: Instant,
     recording_started: Option<Instant>,
+    preview_started: Option<Instant>,
+    profile_duration: Option<Duration>,
     first_patient: u64,
     second_patient: u64,
     physical: bool,
@@ -64,7 +66,11 @@ impl Validation {
         window: &MainWindow,
         directory: &Path,
     ) -> Result<Option<Vec<LibraryEntry>>, String> {
-        if self.started.elapsed() > Duration::from_secs(if self.physical { 180 } else { 45 }) {
+        let timeout = self.profile_duration.map_or_else(
+            || Duration::from_secs(if self.physical { 180 } else { 45 }),
+            |duration| duration.saturating_mul(2) + Duration::from_secs(60),
+        );
+        if self.started.elapsed() > timeout {
             return Err(format!(
                 "Validation timed out at phase {}: {}",
                 self.phase,
@@ -74,6 +80,16 @@ impl Validation {
         if self.phase == 0 {
             if !window.get_is_streaming() {
                 return Ok(None);
+            }
+            if let Some(duration) = self.profile_duration {
+                let started = *self.preview_started.get_or_insert_with(|| {
+                    println!("PERF_PHASE preview");
+                    Instant::now()
+                });
+                if started.elapsed() < duration {
+                    return Ok(None);
+                }
+                println!("PERF_PHASE capture_setup");
             }
             println!(
                 "HARDWARE_BUTTON_STATUS {}",
@@ -146,12 +162,20 @@ impl Validation {
             3 if window.get_is_recording() => {
                 let started = *self.recording_started.get_or_insert_with(|| {
                     println!("BUTTON_VIDEO_STOP_READY recording=true");
+                    if self.profile_duration.is_some() {
+                        println!("PERF_PHASE recording");
+                    }
                     Instant::now()
                 });
-                if !self.physical && started.elapsed() >= Duration::from_secs(4) {
+                if !self.physical
+                    && started.elapsed() >= self.profile_duration.unwrap_or(Duration::from_secs(4))
+                {
                     // Stop remains available even if the selected capture mode changed.
                     window.set_is_video_mode(false);
                     dispatch_hardware_button(window, PhysicalButtonBehavior::FollowMode);
+                    if self.profile_duration.is_some() {
+                        println!("PERF_PHASE finalizing");
+                    }
                     self.phase = 4;
                 }
             }
@@ -185,6 +209,26 @@ pub fn run_hardware_validation(
     output: &Path,
     physical: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_validation(output, physical, None)
+}
+
+/// Profiles the real preview and recording for the same bounded duration.
+/// Captures and verification use the same isolated production validation path.
+/// # Errors
+/// Returns invalid durations or camera/capture/verification failures.
+pub fn run_camera_profile(output: &Path, seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
+    if !(5..=1800).contains(&seconds) {
+        return Err("Profile duration must be between 5 and 1800 seconds per phase".into());
+    }
+    run_validation(output, false, Some(Duration::from_secs(seconds)))
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_validation(
+    output: &Path,
+    physical: bool,
+    profile_duration: Option<Duration>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if output.exists() && fs::read_dir(output)?.next().is_some() {
         return Err("Validation requires an empty directory; existing files are preserved".into());
     }
@@ -207,6 +251,8 @@ pub fn run_hardware_validation(
         phase: 0,
         started: Instant::now(),
         recording_started: None,
+        preview_started: None,
+        profile_duration,
         first_patient: first.id,
         second_patient: second.id,
         physical,
@@ -216,11 +262,26 @@ pub fn run_hardware_validation(
     let current = Rc::clone(&state);
     let weak = window.as_weak();
     let captures = directory.clone();
+    let latest_frame = std::sync::Arc::clone(&runtime.latest_frame);
+    let decode_time = std::sync::Arc::clone(&runtime.decode_time_micros);
+    let dropped_frames = std::sync::Arc::clone(&runtime.dropped_decode_frames);
+    let mut last_sample = Instant::now();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(100),
         move || {
             let Some(window) = weak.upgrade() else { return };
+            if profile_duration.is_some() && last_sample.elapsed() >= Duration::from_secs(1) {
+                last_sample = Instant::now();
+                let sequence = latest_frame
+                    .snapshot()
+                    .map_or(0, |frame| frame.sequence_number);
+                println!(
+                    "PERF_SAMPLE sequence={sequence} dropped_preview={} decode_us={}",
+                    dropped_frames.load(std::sync::atomic::Ordering::Relaxed),
+                    decode_time.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
             let result = current.borrow_mut().advance(&window, &captures);
             match result {
                 Ok(None) => {}

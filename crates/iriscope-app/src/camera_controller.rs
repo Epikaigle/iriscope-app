@@ -1,7 +1,7 @@
 use crate::app_helpers::{
-    decode_camera_frame_to_rgb8, dispatch_hardware_button, settings_snapshot,
-    stream_configurations_for_quality,
+    dispatch_hardware_button, settings_snapshot, stream_configurations_for_quality,
 };
+use crate::camera_queue::SharedCameraFrame;
 use crate::config::NOTICE_ERROR;
 use crate::controls_ui::{
     CameraControlRuntimeState, camera_control_key, compatible_saved_camera_control_value,
@@ -20,7 +20,7 @@ use iriscope_core::capabilities::{
     StandardCameraControl,
 };
 use iriscope_core::settings::SavedCameraControlValue;
-use slint::{ComponentHandle, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -440,12 +440,12 @@ fn start_decoder_worker(main_window: &MainWindow, runtime: &AppRuntime) -> threa
                 continue;
             }
             let decode_start = Instant::now();
-            let decoded_frame = decode_camera_frame_to_rgb8(&job.frame);
+            let decoded_frame = job.frame.decode_for_preview();
             let elapsed_micros =
                 u64::try_from(decode_start.elapsed().as_micros()).unwrap_or(u64::MAX);
             decode_time_micros_worker.store(elapsed_micros, Ordering::Relaxed);
 
-            let Some(decoded_frame) = decoded_frame else {
+            let Some(pixels) = decoded_frame else {
                 continue;
             };
             if !job.is_current(&stream_generation_decoder)
@@ -453,9 +453,6 @@ fn start_decoder_worker(main_window: &MainWindow, runtime: &AppRuntime) -> threa
             {
                 continue;
             }
-            let (width, height, rgb) = decoded_frame;
-            let pixels = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(&rgb, width, height);
-            drop(rgb);
             if let Ok(mut latest) = latest_decoded_frame_worker.lock() {
                 *latest = Some((job.generation, pixels));
             }
@@ -848,12 +845,14 @@ fn start_camera_worker(main_window: &MainWindow, runtime: &AppRuntime) -> thread
                         stat_frames += 1;
 
                         latest_frame_clone.publish(frame.clone());
+                        let shared_frame = Arc::new(SharedCameraFrame::new(frame));
                         if preview_active_camera.load(Ordering::Acquire)
-                            && decode_mailbox_camera.publish(generation, frame.clone())
+                            && decode_mailbox_camera
+                                .publish_shared(generation, Arc::clone(&shared_frame))
                         {
                             dropped_decode_frames_camera.fetch_add(1, Ordering::Relaxed);
                         }
-                        recording_mailbox_camera.publish_frame(frame);
+                        recording_mailbox_camera.publish_shared_frame(shared_frame);
 
                         if !stream_ready_announced {
                             stream_ready_announced = true;

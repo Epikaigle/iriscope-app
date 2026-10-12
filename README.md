@@ -314,7 +314,8 @@ Organisation du workspace :
 - `iriscope-camera-windows` : backend Media Foundation ;
 - `iriscope-camera-macos` : backend AVFoundation ;
 - `iriscope-imaging` : décodage et transformations d'image, sans dépendance au cœur applicatif ;
-- `iriscope-app` : application Slint.
+- `iriscope-app` : application Slint ;
+- `iriscope-updater` : vérification des mises à jour signées, téléchargement et installation.
 
 `helpers/linux/` contient la passerelle du bouton DE400, son service et sa
 documentation. `scripts/install-de400-button.sh` et
@@ -565,7 +566,7 @@ l’empreinte du binaire fourni et la disponibilité du moteur MP4. Les scripts
 refusent un binaire dont `--version` ne correspond pas au manifeste. Les paramètres
 et captures restent hors des fichiers installés ; les identifiants des installateurs
 restent constants lors d’une mise à jour. Les instructions sont dans
-[documentation/RELEASE-0.4.4.md](documentation/RELEASE-0.4.4.md).
+[documentation/RELEASE-0.4.5.md](documentation/RELEASE-0.4.5.md).
 
 Pour inclure un FFmpeg autonome construit pour le système cible, les deux scripts
 acceptent `--ffmpeg chemin/ffmpeg` et `--ffmpeg-license chemin/COPYING.txt`.

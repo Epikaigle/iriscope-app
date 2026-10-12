@@ -1,6 +1,7 @@
 use crate::app_helpers::{capture_session_from_window, decode_camera_frame_to_rgb8};
 #[cfg(test)]
 use crate::camera_queue::DecodeMailbox;
+use crate::camera_queue::SharedCameraFrame;
 use crate::config::{MAX_QUEUED_RECORDING_FRAMES, NOTICE_ERROR, NOTICE_SUCCESS};
 use crate::library_ui::load_video_thumbnail;
 #[cfg(test)]
@@ -12,6 +13,7 @@ use crate::library_worker::{
 use crate::photo_worker::{PhotoRequest, save_photo};
 use crate::playback::show_capture_notice;
 use crate::ui::MainWindow;
+#[cfg(test)]
 use iriscope_core::camera::CapturedFrame;
 use iriscope_core::capabilities::{FrameRate, PixelFormat};
 #[cfg(test)]
@@ -48,7 +50,7 @@ pub(super) enum RecordingStopReason {
 
 pub(super) enum RecordingCommand {
     Start(u64, RecordingRequest),
-    Frame(u64, CapturedFrame),
+    Frame(u64, Arc<SharedCameraFrame>),
     Stop(u64, RecordingStopReason, u64, Option<Duration>),
 }
 
@@ -134,7 +136,12 @@ impl RecordingMailbox {
         Some(generation)
     }
 
+    #[cfg(test)]
     pub(super) fn publish_frame(&self, frame: CapturedFrame) {
+        self.publish_shared_frame(Arc::new(SharedCameraFrame::new(frame)));
+    }
+
+    pub(super) fn publish_shared_frame(&self, frame: Arc<SharedCameraFrame>) {
         let mut state = self
             .state
             .lock()
@@ -145,15 +152,17 @@ impl RecordingMailbox {
         state.last_frame_timestamp = Some(
             state
                 .last_frame_timestamp
-                .map_or(frame.timestamp, |last| last.max(frame.timestamp)),
+                .map_or(frame.frame.timestamp, |last| {
+                    last.max(frame.frame.timestamp)
+                }),
         );
         if state.queued_frames >= MAX_QUEUED_RECORDING_FRAMES
-            || frame.data.len() > self.byte_budget.saturating_sub(state.queued_bytes)
+            || frame.frame.data.len() > self.byte_budget.saturating_sub(state.queued_bytes)
         {
             state.dropped_frames = state.dropped_frames.saturating_add(1);
             return;
         }
-        state.queued_bytes += frame.data.len();
+        state.queued_bytes += frame.frame.data.len();
         state
             .commands
             .push_back(RecordingCommand::Frame(generation, frame));
@@ -207,7 +216,7 @@ impl RecordingMailbox {
             if let Some(command) = state.commands.pop_front() {
                 if let RecordingCommand::Frame(_, frame) = &command {
                     state.queued_frames -= 1;
-                    state.queued_bytes = state.queued_bytes.saturating_sub(frame.data.len());
+                    state.queued_bytes = state.queued_bytes.saturating_sub(frame.frame.data.len());
                 }
                 return Some(command);
             }
@@ -531,16 +540,16 @@ pub(super) fn run_recording_worker(
                 if recording.error.is_some() {
                     continue;
                 }
-                let jpeg = match frame.pixel_format {
+                let jpeg = match frame.frame.pixel_format {
                     PixelFormat::Mjpeg => {
-                        let jpeg = ensure_jpeg_has_dht(&frame.data);
-                        if decode_mjpeg_to_rgb8(&jpeg).is_err() {
+                        let jpeg = ensure_jpeg_has_dht(&frame.frame.data);
+                        if !frame.validate_mjpeg() {
                             recording.invalid_frames = recording.invalid_frames.saturating_add(1);
                             continue;
                         }
                         Ok(jpeg)
                     }
-                    _ => decode_camera_frame_to_rgb8(&frame)
+                    _ => decode_camera_frame_to_rgb8(&frame.frame)
                         .ok_or_else(|| "format caméra non décodable".to_owned())
                         .and_then(|(width, height, rgb)| {
                             encode_rgb8_jpeg(&rgb, width, height, 95)
@@ -548,9 +557,9 @@ pub(super) fn run_recording_worker(
                                 .map_err(|error| error.to_string())
                         }),
                 };
-                let result = jpeg
-                    .map_err(|error| error.to_string())
-                    .and_then(|jpeg| recording.write_timed_frame(jpeg.as_ref(), frame.timestamp));
+                let result = jpeg.map_err(|error| error.to_string()).and_then(|jpeg| {
+                    recording.write_timed_frame(jpeg.as_ref(), frame.frame.timestamp)
+                });
                 match result {
                     Ok(()) => {}
                     Err(error) => {
@@ -922,7 +931,7 @@ mod recording_pipeline_tests {
             assert!(matches!(
                 mailbox.receive(),
                 Some(RecordingCommand::Frame(id, frame))
-                    if id == generation && frame.sequence_number == sequence
+                    if id == generation && frame.frame.sequence_number == sequence
             ));
         }
         assert!(matches!(

@@ -5,7 +5,7 @@ use iriscope_core::library::{
     CaptureFileVersion, capture_file_version_fast, capture_file_version_fast_from_file,
 };
 use iriscope_core::video::AviMjpegReader;
-use iriscope_imaging::{decode_mjpeg_to_rgb8, decode_reference_image_to_rgb8, ensure_jpeg_has_dht};
+use iriscope_imaging::decode_reference_image_to_rgb8;
 use slint::{ComponentHandle, Rgb8Pixel, SharedPixelBuffer};
 use std::fs::File;
 use std::io::Read;
@@ -306,6 +306,7 @@ pub(super) struct ViewerOpenRequest {
 pub(super) struct ViewerOpenState {
     pub(super) pending: Option<ViewerOpenRequest>,
     pub(super) closed: bool,
+    revision: u64,
 }
 
 /// A single viewer worker handles the newest open request, bounding file I/O and decoding.
@@ -323,8 +324,67 @@ impl ViewerOpenMailbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.closed {
             state.pending = Some(request);
+            state.revision = state.revision.wrapping_add(1);
             self.ready.notify_one();
         }
+    }
+
+    /// Wake playback after its control state changes. The revision, unlike a
+    /// notification alone, preserves changes made just before the worker waits.
+    pub(super) fn signal_playback_change(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.revision = state.revision.wrapping_add(1);
+        self.ready.notify_one();
+    }
+
+    fn playback_revision(&self) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!state.closed).then_some(state.revision)
+    }
+
+    fn playback_revision_if_current(
+        &self,
+        current_generation: &AtomicU64,
+        generation: u64,
+    ) -> Option<u64> {
+        let revision = self.playback_revision()?;
+        // Check cancellation after the revision snapshot. A replacement that
+        // completed before the snapshot must stop this playback; one arriving
+        // afterwards will change the revision and interrupt its wait.
+        (current_generation.load(Ordering::Acquire) == generation).then_some(revision)
+    }
+
+    /// Sleep until controls change, shutdown, or the next frame is due. A
+    /// paused viewer has no deadline and consumes no periodic wakeups.
+    fn wait_for_playback_change(&self, revision: u64, deadline: Option<Instant>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.closed && state.pending.is_none() && state.revision == revision {
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                (state, _) = self
+                    .ready
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            } else {
+                state = self
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        !state.closed
     }
 
     pub(super) fn receive(&self) -> Option<ViewerOpenRequest> {
@@ -453,7 +513,7 @@ pub(super) struct ViewerRuntime {
 }
 
 impl ViewerRuntime {
-    pub(super) fn run(&self, mailbox: &ViewerOpenMailbox) {
+    pub(super) fn run(&self, mailbox: &Arc<ViewerOpenMailbox>) {
         while let Some(request) = mailbox.receive() {
             if self.generation.load(Ordering::Acquire) != request.generation {
                 continue;
@@ -461,7 +521,7 @@ impl ViewerRuntime {
             if request.is_photo {
                 self.open_photo(&request);
             } else {
-                self.open_video(&request);
+                self.open_video(&request, mailbox);
             }
         }
     }
@@ -514,7 +574,7 @@ impl ViewerRuntime {
     }
 
     #[allow(clippy::too_many_lines)] // One playback loop owns the verified handle and cancellation state.
-    pub(super) fn open_video(&self, request: &ViewerOpenRequest) {
+    pub(super) fn open_video(&self, request: &ViewerOpenRequest, mailbox: &Arc<ViewerOpenMailbox>) {
         let generation = request.generation;
         if !request.expected_version.supports_fast_validation() {
             self.schedule_slow_video_validation(generation);
@@ -554,10 +614,10 @@ impl ViewerRuntime {
         }
         let frame_count = reader.frame_count();
         let fps = reader.frame_rate().frames_per_second();
-        let first_frame = reader.read_frame(0).ok().and_then(|jpeg| {
-            let jpeg = ensure_jpeg_has_dht(&jpeg);
-            decode_mjpeg_to_rgb8(&jpeg).ok()
-        });
+        let first_frame = reader
+            .read_frame(0)
+            .ok()
+            .and_then(|jpeg| crate::pixel_buffer::decode_mjpeg_pixels(&jpeg).ok());
         if !video_reader_matches(&reader, request) {
             self.schedule_changed_capture(generation);
             return;
@@ -566,7 +626,7 @@ impl ViewerRuntime {
             self.schedule_video_open_error(generation);
             return;
         };
-        self.schedule_video_start(generation, frame_count, fps);
+        self.schedule_video_start(generation, frame_count, fps, mailbox);
         let initial_seek_epoch = self
             .seek
             .lock()
@@ -575,24 +635,21 @@ impl ViewerRuntime {
         self.publish_video_frame(ViewerDisplayFrame {
             generation,
             seek_epoch: initial_seek_epoch,
-            pixels: SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(
-                &first_frame.2,
-                first_frame.0,
-                first_frame.1,
-            ),
+            pixels: first_frame,
             progress: 0.0,
             position: "00:00".to_owned(),
         });
-        drop(first_frame);
 
         let frame_duration = Duration::from_secs_f64(1.0 / fps);
+        let mut first_frame_deadline = Some(Instant::now() + frame_duration);
         let mut frame_index = 1 % frame_count;
-        let mut frame_attempted = true;
-        while self.generation.load(Ordering::Acquire) == generation {
-            if !video_reader_matches(&reader, request) {
-                self.schedule_changed_capture(generation);
-                return;
-            }
+        loop {
+            // Snapshot before inspecting controls so a concurrent change cannot
+            // be lost between inspecting the state and entering the wait.
+            let Some(revision) = mailbox.playback_revision_if_current(&self.generation, generation)
+            else {
+                break;
+            };
             let (requested_seek, seek_epoch) = {
                 let mut seek = self
                     .seek
@@ -601,15 +658,40 @@ impl ViewerRuntime {
                 (seek.requested_frame.take(), seek.epoch)
             };
             if let Some(requested_seek) = requested_seek {
+                // Seeking replaces the startup frame immediately, even when its
+                // original presentation interval has not elapsed yet.
+                first_frame_deadline = None;
                 frame_index = usize::try_from(requested_seek)
                     .unwrap_or(usize::MAX)
                     .min(frame_count.saturating_sub(1));
             }
 
             let playing = self.playing.load(Ordering::Acquire);
-            if !playing && requested_seek.is_none() && frame_attempted {
-                thread::sleep(Duration::from_millis(20));
+            if !playing && requested_seek.is_none() {
+                if !mailbox.wait_for_playback_change(revision, None) {
+                    break;
+                }
                 continue;
+            }
+
+            // The first image is already published. Hold it for one frame
+            // interval without delaying UI delivery or polling; control changes
+            // interrupt this deadline and are inspected at the top of the loop.
+            if let Some(deadline) = first_frame_deadline {
+                if Instant::now() < deadline {
+                    if !mailbox.wait_for_playback_change(revision, Some(deadline)) {
+                        break;
+                    }
+                    continue;
+                }
+                first_frame_deadline = None;
+            }
+
+            // Paused pixels are an immutable verified snapshot. Revalidate the
+            // handle and path before each new frame, including a resumed seek.
+            if !video_reader_matches(&reader, request) {
+                self.schedule_changed_capture(generation);
+                return;
             }
 
             let frame_started = Instant::now();
@@ -621,41 +703,30 @@ impl ViewerRuntime {
                 }
                 return;
             };
-            let jpeg = ensure_jpeg_has_dht(&jpeg);
-            let decoded = decode_mjpeg_to_rgb8(&jpeg);
+            let decoded = crate::pixel_buffer::decode_mjpeg_pixels(&jpeg);
             if !video_reader_matches(&reader, request) {
                 self.schedule_changed_capture(generation);
                 return;
             }
-            if let Ok((width, height, rgb)) = decoded {
+            if let Ok(pixels) = decoded {
                 if self.generation.load(Ordering::Acquire) != generation {
                     break;
                 }
                 let frame = ViewerDisplayFrame {
                     generation,
                     seek_epoch,
-                    pixels: SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(&rgb, width, height),
+                    pixels,
                     progress: video_progress(frame_index, frame_count),
                     position: format_playback_time(video_time_seconds(frame_index, fps)),
                 };
                 self.publish_video_frame(frame);
             }
-            frame_attempted = true;
-
             if playing {
                 frame_index = (frame_index + 1) % frame_count;
                 let remaining = frame_duration.saturating_sub(frame_started.elapsed());
-                // Bound the delay before a newly opened file can replace this playback.
-                let deadline = Instant::now() + remaining;
-                while self.generation.load(Ordering::Acquire) == generation {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    thread::sleep(remaining.min(Duration::from_millis(20)));
+                if !mailbox.wait_for_playback_change(revision, Some(Instant::now() + remaining)) {
+                    break;
                 }
-            } else {
-                thread::sleep(Duration::from_millis(20));
             }
         }
 
@@ -720,17 +791,25 @@ impl ViewerRuntime {
         });
     }
 
-    pub(super) fn schedule_video_start(&self, generation: u64, frame_count: usize, fps: f64) {
+    pub(super) fn schedule_video_start(
+        &self,
+        generation: u64,
+        frame_count: usize,
+        fps: f64,
+        mailbox: &Arc<ViewerOpenMailbox>,
+    ) {
         let frame_count_u64 = u64::try_from(frame_count).unwrap_or(u64::MAX);
         let setup_generation = Arc::clone(&self.generation);
         let setup_playing = Arc::clone(&self.playing);
         let setup_frame_count = Arc::clone(&self.frame_count);
+        let setup_mailbox = Arc::clone(mailbox);
         let _ = self.weak.upgrade_in_event_loop(move |viewer| {
             if setup_generation.load(Ordering::Acquire) != generation {
                 return;
             }
             setup_frame_count.store(frame_count_u64, Ordering::Release);
             setup_playing.store(true, Ordering::Release);
+            setup_mailbox.signal_playback_change();
             viewer.set_viewer_loading(false);
             viewer.set_viewer_is_video(true);
             viewer.set_viewer_video_playing(true);
@@ -792,6 +871,50 @@ fn video_reader_matches(reader: &AviMjpegReader, request: &ViewerOpenRequest) ->
 
 #[cfg(test)]
 mod playback_tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual synthetic performance measurement"]
+    fn benchmark_paused_playback_waits() {
+        use std::sync::atomic::AtomicBool;
+        fn switches() -> u64 {
+            std::fs::read_to_string("/proc/thread-self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+        for polling in [true, false] {
+            let mailbox = std::sync::Arc::new(super::ViewerOpenMailbox::default());
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let worker_mailbox = std::sync::Arc::clone(&mailbox);
+            let worker_stop = std::sync::Arc::clone(&stop);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let before = switches();
+                let revision = worker_mailbox.playback_revision().unwrap();
+                ready_tx.send(()).unwrap();
+                if polling {
+                    while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                } else {
+                    worker_mailbox.wait_for_playback_change(revision, None);
+                }
+                switches() - before
+            });
+            ready_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            mailbox.close();
+            let contexts = worker.join().unwrap();
+            eprintln!(
+                "paused_wait polling={polling} duration_ms=1200 voluntary_context_switches={contexts}"
+            );
+        }
+    }
     use super::{
         ViewerDisplayFrame, ViewerDisplayMailbox, ViewerOpenMailbox, ViewerOpenRequest,
         format_playback_time, open_verified_capture, open_verified_video, read_verified_photo,
@@ -807,7 +930,13 @@ mod playback_tests {
         fs::{self, File, FileTimes},
         io::{Seek, SeekFrom, Write},
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     fn fixture(label: &str) -> (PathBuf, PathBuf, CaptureFileVersion) {
@@ -905,6 +1034,194 @@ mod playback_tests {
         });
         mailbox.close();
         assert!(mailbox.receive().is_none());
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn playback_controls_cannot_lose_a_signal_before_or_during_wait() {
+        let mailbox = Arc::new(ViewerOpenMailbox::default());
+        for iteration in 0..64 {
+            let revision = mailbox.playback_revision().expect("open worker");
+            if iteration % 2 == 0 {
+                mailbox.signal_playback_change();
+            }
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker_mailbox = Arc::clone(&mailbox);
+            let worker = thread::spawn(move || {
+                ready_tx.send(()).expect("ready");
+                done_tx
+                    .send(worker_mailbox.wait_for_playback_change(revision, None))
+                    .expect("done");
+            });
+            ready_rx.recv().expect("worker ready");
+            if iteration % 2 != 0 {
+                // Yield permits both signal-before-park and signal-after-park
+                // schedules. The revision must make either schedule safe.
+                thread::yield_now();
+                mailbox.signal_playback_change();
+            }
+            let result = done_rx.recv_timeout(Duration::from_secs(2));
+            mailbox.signal_playback_change(); // Release worker even on failure.
+            worker.join().expect("worker");
+            assert!(result.expect("control change must wake playback"));
+        }
+    }
+
+    #[test]
+    fn playback_controls_interrupt_a_slow_frame_deadline() {
+        let mailbox = Arc::new(ViewerOpenMailbox::default());
+        let revision = mailbox.playback_revision().expect("open worker");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_mailbox = Arc::clone(&mailbox);
+        let worker = thread::spawn(move || {
+            ready_tx.send(()).expect("ready");
+            done_tx
+                .send(worker_mailbox.wait_for_playback_change(
+                    revision,
+                    Some(Instant::now() + Duration::from_secs(60)),
+                ))
+                .expect("done");
+        });
+        ready_rx.recv().expect("worker ready");
+        mailbox.signal_playback_change();
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        mailbox.close();
+        worker.join().expect("worker");
+        assert!(result.expect("pause or seek interrupts the full frame delay"));
+    }
+
+    #[test]
+    fn playback_spurious_notifications_preserve_the_frame_deadline() {
+        let mailbox = Arc::new(ViewerOpenMailbox::default());
+        let revision = mailbox.playback_revision().expect("open worker");
+        let notifier = Arc::clone(&mailbox);
+        let worker = thread::spawn(move || {
+            for _ in 0..5 {
+                thread::sleep(Duration::from_millis(10));
+                notifier.ready.notify_one();
+            }
+        });
+        let started = Instant::now();
+        assert!(
+            mailbox.wait_for_playback_change(revision, Some(started + Duration::from_millis(80)),)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        worker.join().expect("notifier");
+    }
+
+    #[test]
+    fn playback_shutdown_wakes_both_paused_and_timed_waiters() {
+        for deadline in [None, Some(Instant::now() + Duration::from_secs(60))] {
+            let mailbox = Arc::new(ViewerOpenMailbox::default());
+            let revision = mailbox.playback_revision().expect("open worker");
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker_mailbox = Arc::clone(&mailbox);
+            let worker = thread::spawn(move || {
+                done_tx
+                    .send(worker_mailbox.wait_for_playback_change(revision, deadline))
+                    .expect("done");
+            });
+            mailbox.close();
+            assert!(
+                !done_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("shutdown wakes the worker")
+            );
+            worker.join().expect("worker");
+            assert!(mailbox.playback_revision().is_none());
+        }
+    }
+
+    #[test]
+    fn replacing_a_paused_video_wakes_and_retains_the_latest_generation() {
+        let mailbox = Arc::new(ViewerOpenMailbox::default());
+        let revision = mailbox.playback_revision().expect("open worker");
+        let (directory, _, version) = fixture("paused-replacement");
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_mailbox = Arc::clone(&mailbox);
+        let worker = thread::spawn(move || {
+            assert!(worker_mailbox.wait_for_playback_change(revision, None));
+            done_tx
+                .send(
+                    worker_mailbox
+                        .receive()
+                        .expect("new open request")
+                        .generation,
+                )
+                .expect("done");
+        });
+        mailbox.request(ViewerOpenRequest {
+            path: "replacement.avi".into(),
+            generation: 17,
+            is_photo: false,
+            expected_version: version,
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        mailbox.close();
+        worker.join().expect("worker");
+        assert_eq!(result.expect("replacement interrupts the paused video"), 17);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn replacement_before_revision_snapshot_cancels_the_previous_playback() {
+        let mailbox = ViewerOpenMailbox::default();
+        let generation = AtomicU64::new(16);
+        let (directory, _, version) = fixture("replacement-before-snapshot");
+        // Reproduce the old loop's interleaving deterministically: its initial
+        // generation check succeeds, then the UI completes a replacement before
+        // the worker reads the mailbox revision.
+        assert_eq!(generation.load(Ordering::Acquire), 16);
+        generation.store(17, Ordering::Release);
+        mailbox.request(ViewerOpenRequest {
+            path: "replacement.avi".into(),
+            generation: 17,
+            is_photo: false,
+            expected_version: version,
+        });
+        assert!(
+            mailbox
+                .playback_revision_if_current(&generation, 16)
+                .is_none()
+        );
+        assert_eq!(
+            mailbox.receive().expect("replacement retained").generation,
+            17
+        );
+        assert!(
+            mailbox
+                .playback_revision_if_current(&generation, 17)
+                .is_some()
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn pending_replacement_prevents_parking_after_its_notification() {
+        let mailbox = Arc::new(ViewerOpenMailbox::default());
+        let (directory, _, version) = fixture("pending-before-wait");
+        mailbox.request(ViewerOpenRequest {
+            path: "replacement.avi".into(),
+            generation: 17,
+            is_photo: false,
+            expected_version: version,
+        });
+        // No later notification occurs: reading the updated revision must not
+        // allow an old playback to park while an open request is already ready.
+        let revision = mailbox.playback_revision().expect("open worker");
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_mailbox = Arc::clone(&mailbox);
+        let worker = thread::spawn(move || {
+            done_tx
+                .send(worker_mailbox.wait_for_playback_change(revision, None))
+                .expect("done");
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        mailbox.close();
+        worker.join().expect("worker");
+        assert!(result.expect("pending replacement prevents waiting"));
         fs::remove_dir_all(directory).expect("cleanup");
     }
 

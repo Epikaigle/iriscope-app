@@ -2,7 +2,7 @@
 
 Ces essais doivent être exécutés avec la caméra réelle sur chaque système pris en charge. Les tests cloud, les images synthétiques et la compilation croisée ne remplacent pas cette validation.
 
-État au **11 octobre 2026** : la version publiée est la 0.4.3, avec deux
+État au **12 octobre 2026** : la version préparée est la 0.4.5, avec deux
 installateurs, Linux amd64 `.deb` et macOS Intel `.dmg`. Le bouton, les captures
 et les réglages du DE400 sont documentés sous Linux et sur Mac Intel sous
 macOS 15.7.7. Les [essais Mac du 8 octobre](VALIDATION-MACOS-2026-10-08.md)
@@ -12,6 +12,16 @@ le paquet et la mise à jour. Windows et Mac Apple Silicon ne sont pas publiés
 dans cette release et restent sans validation matérielle. La liste suivante
 est le protocole à compléter pour chaque système, pas une affirmation que
 tous ses parcours ont déjà été exécutés.
+
+La revue du 12 octobre ajoute trois essais Linux de 60 secondes d'aperçu et
+60 secondes de vidéo, dont un avec une construction intermédiaire optimisée
+avant la dernière correction du mode développement. Les captures, l'export
+et la sauvegarde/restauration ont réussi. Ces essais ne comportent pas de
+nouvelles pressions physiques et ne remplacent pas une session de 30 minutes.
+Un quatrième essai avec le binaire final 0.4.5 a ensuite réussi : 60 secondes
+d'aperçu, 60 secondes de vidéo (481 images lisibles), export MP4 et
+sauvegarde/restauration identique. Les résultats et leurs limites figurent
+dans [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Préparation
 

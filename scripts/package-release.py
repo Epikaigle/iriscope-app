@@ -96,6 +96,7 @@ def shared_files() -> list[tuple[str, bytes]]:
         ("documentation/VALIDATION-INTERFACE-2026-10-06.md", (ROOT / "documentation/VALIDATION-INTERFACE-2026-10-06.md").read_bytes()),
         ("scripts/diagnose-de400-button.py", (ROOT / "scripts/diagnose-de400-button.py").read_bytes()),
         ("scripts/diagnose-de400-usb-status.py", (ROOT / "scripts/diagnose-de400-usb-status.py").read_bytes()),
+        ("scripts/profile-camera.py", (ROOT / "scripts/profile-camera.py").read_bytes()),
         ("scripts/install-de400-button.sh", (ROOT / "scripts/install-de400-button.sh").read_bytes()),
         ("scripts/uninstall-de400-button.sh", (ROOT / "scripts/uninstall-de400-button.sh").read_bytes()),
         ("helpers/linux/README.md", (ROOT / "helpers/linux/README.md").read_bytes()),

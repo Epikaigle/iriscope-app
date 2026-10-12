@@ -373,14 +373,22 @@ pub(super) fn display_settings(win: &MainWindow) -> DisplaySettings {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )] // Inputs are bounded to ±100; output pixels are rounded and clamped to 0..255.
+fn channel_map(settings: DisplaySettings) -> Option<[u8; 256]> {
+    if settings.brightness == 0 && settings.contrast == 0 {
+        return None;
+    }
+    let brightness = settings.brightness.clamp(-100, 100) as f32 * 1.5;
+    let contrast = 2.0_f32.powf(settings.contrast.clamp(-100, 100) as f32 / 100.0);
+    Some(std::array::from_fn(|value| {
+        ((value as f32 - 127.5) * contrast + 127.5 + brightness)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    }))
+}
 pub(super) fn transform(mut image: image::RgbImage, settings: DisplaySettings) -> image::RgbImage {
-    if settings.brightness != 0 || settings.contrast != 0 {
-        let brightness = settings.brightness.clamp(-100, 100) as f32 * 1.5;
-        let contrast = 2.0_f32.powf(settings.contrast.clamp(-100, 100) as f32 / 100.0);
+    if let Some(map) = channel_map(settings) {
         for value in image.as_mut() {
-            *value = ((f32::from(*value) - 127.5) * contrast + 127.5 + brightness)
-                .round()
-                .clamp(0.0, 255.0) as u8;
+            *value = map[usize::from(*value)];
         }
     }
     let mut image = iriscope_imaging::rotate_rgb(image, settings.rotation);
@@ -388,6 +396,39 @@ pub(super) fn transform(mut image: image::RgbImage, settings: DisplaySettings) -
         image::imageops::flip_horizontal_in_place(&mut image);
     }
     image
+}
+
+struct DisplayPixels(slint::SharedPixelBuffer<slint::Rgb8Pixel>);
+
+impl AsMut<[u8]> for DisplayPixels {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.0.make_mut_bytes()
+    }
+}
+
+fn transform_display(
+    mut pixels: slint::SharedPixelBuffer<slint::Rgb8Pixel>,
+    settings: DisplaySettings,
+) -> Result<slint::SharedPixelBuffer<slint::Rgb8Pixel>, iriscope_imaging::ImagingError> {
+    let map = channel_map(settings);
+    if settings.rotation.rem_euclid(360) == 0 && !settings.mirror {
+        if let Some(map) = map {
+            for value in pixels.make_mut_bytes() {
+                *value = map[usize::from(*value)];
+            }
+        }
+        return Ok(pixels);
+    }
+    iriscope_imaging::transform_rgb_to_buffer(
+        pixels.as_bytes(),
+        pixels.width(),
+        pixels.height(),
+        settings.rotation,
+        settings.mirror,
+        map.as_ref(),
+        |width, height| DisplayPixels(slint::SharedPixelBuffer::new(width, height)),
+    )
+    .map(|(_, _, pixels)| pixels.0)
 }
 pub(super) fn projected_review(
     review: &PhotoReview,
@@ -504,24 +545,25 @@ impl DisplayRenderer {
             if !self.current(&request) {
                 continue;
             }
-            let Some(image) = image::RgbImage::from_raw(
-                request.pixels.width(),
-                request.pixels.height(),
-                request.pixels.as_bytes().to_vec(),
-            ) else {
-                continue;
-            };
-            let image = transform(image, request.settings);
-            let pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
-                image.as_raw(),
-                image.width(),
-                image.height(),
-            );
+            let result = transform_display(request.pixels.clone(), request.settings);
             let renderer = Arc::clone(&self);
             let _ = self.weak.upgrade_in_event_loop(move |win| {
                 if renderer.generation.load(Ordering::Acquire) == request.generation {
-                    win.set_viewer_image(slint::Image::from_rgb8(pixels));
                     let state = win.global::<AppState>();
+                    let pixels = match result {
+                        Ok(pixels) => pixels,
+                        Err(error) => {
+                            if renderer.current(&request) {
+                                state.set_viewer_adjusting(false);
+                                state.set_viewer_feedback_error(true);
+                                state.set_viewer_feedback(
+                                    format!("Réglage de la photo indisponible : {error}").into(),
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    win.set_viewer_image(slint::Image::from_rgb8(pixels));
                     // Show intermediate frames during a drag, and only finish when caught up.
                     state.set_viewer_adjusting(!renderer.current(&request));
                     state.set_viewer_pan_x(0.0);
@@ -709,6 +751,99 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "manual synthetic performance measurement"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn benchmark_photo_display() {
+        use std::{hint::black_box, time::Instant};
+        let (width, height) = (1280, 1024);
+        let original = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+            &(0..width * height * 3)
+                .map(|n| (n % 256) as u8)
+                .collect::<Vec<_>>(),
+            width,
+            height,
+        );
+        for (label, settings) in [
+            ("neutral", DisplaySettings::default()),
+            (
+                "channels",
+                DisplaySettings {
+                    brightness: 25,
+                    contrast: 40,
+                    ..Default::default()
+                },
+            ),
+            (
+                "rotate37",
+                DisplaySettings {
+                    brightness: 25,
+                    contrast: 40,
+                    rotation: 37,
+                    mirror: true,
+                },
+            ),
+        ] {
+            let mut copied = Vec::new();
+            let mut direct = Vec::new();
+            for round in 0..45 {
+                for old in [round % 2 == 0, round % 2 != 0] {
+                    let started = Instant::now();
+                    if old {
+                        // Isolate the former display copies and per-channel formula;
+                        // both paths use the current, pixel-equivalent rotation engine.
+                        let mut image =
+                            image::RgbImage::from_raw(width, height, original.as_bytes().to_vec())
+                                .unwrap();
+                        if settings.brightness != 0 || settings.contrast != 0 {
+                            let brightness = settings.brightness.clamp(-100, 100) as f32 * 1.5;
+                            let contrast =
+                                2.0_f32.powf(settings.contrast.clamp(-100, 100) as f32 / 100.0);
+                            for value in image.as_mut() {
+                                *value =
+                                    ((f32::from(*value) - 127.5) * contrast + 127.5 + brightness)
+                                        .round()
+                                        .clamp(0.0, 255.0)
+                                        as u8;
+                            }
+                        }
+                        let mut image = iriscope_imaging::rotate_rgb(image, settings.rotation);
+                        if settings.mirror {
+                            image::imageops::flip_horizontal_in_place(&mut image);
+                        }
+                        black_box(
+                            slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                                image.as_raw(),
+                                image.width(),
+                                image.height(),
+                            ),
+                        );
+                    } else {
+                        black_box(transform_display(original.clone(), settings).unwrap());
+                    }
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    if round >= 5 {
+                        if old {
+                            copied.push(elapsed);
+                        } else {
+                            direct.push(elapsed);
+                        }
+                    }
+                }
+            }
+            copied.sort_by(f64::total_cmp);
+            direct.sort_by(f64::total_cmp);
+            eprintln!(
+                "photo_display case={label} runs=40 copied_median_ms={:.3} direct_median_ms={:.3} copied_p95_ms={:.3} direct_p95_ms={:.3}",
+                copied[20], direct[20], copied[38], direct[38]
+            );
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -740,7 +875,7 @@ mod tests {
         )
         .expect("all RGB channel values");
         for (brightness, contrast) in [(0, 0), (50, 100), (-100, -100), (150, -150)] {
-            for rotation in [0, 37, 90, 180, 270] {
+            for rotation in [-37, 0, 1, 37, 89, 90, 135, 180, 270, 315, 360] {
                 for mirror in [false, true] {
                     let settings = DisplaySettings {
                         brightness,
@@ -748,14 +883,48 @@ mod tests {
                         rotation,
                         mirror,
                     };
+                    let expected = reference(source.clone(), settings);
                     assert_eq!(
                         transform(source.clone(), settings),
-                        reference(source.clone(), settings),
+                        expected,
                         "brightness={brightness}, contrast={contrast}, rotation={rotation}, mirror={mirror}"
+                    );
+                    let original = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                        source.as_raw(),
+                        source.width(),
+                        source.height(),
+                    );
+                    let output = transform_display(original.clone(), settings).unwrap();
+                    assert_eq!((output.width(), output.height()), expected.dimensions());
+                    assert_eq!(output.as_bytes(), expected.as_raw());
+                    assert_eq!(
+                        original.as_bytes(),
+                        source.as_raw(),
+                        "original remains unchanged"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn neutral_display_settings_share_original_pixels() {
+        let original = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+            &[10_u8, 20, 30, 200, 210, 220],
+            2,
+            1,
+        );
+        let output = transform_display(original.clone(), DisplaySettings::default()).unwrap();
+        assert_eq!(original.as_bytes().as_ptr(), output.as_bytes().as_ptr());
+        let output = transform_display(
+            original.clone(),
+            DisplaySettings {
+                rotation: 360,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(original.as_bytes().as_ptr(), output.as_bytes().as_ptr());
     }
 
     #[test]

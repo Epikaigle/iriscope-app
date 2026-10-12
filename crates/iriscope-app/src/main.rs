@@ -8,6 +8,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let args: Vec<_> = std::env::args().collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--profile-camera") {
+        let directory = args
+            .get(index + 1)
+            .ok_or("Specify an empty profile directory")?;
+        let seconds = args
+            .get(index + 2)
+            .map_or(Ok(30), |value| value.parse::<u64>())?;
+        return iriscope_app::run_camera_profile(std::path::Path::new(directory), seconds);
+    }
     if let Some(index) = args
         .iter()
         .position(|arg| matches!(arg.as_str(), "--validate-hardware" | "--validate-button"))

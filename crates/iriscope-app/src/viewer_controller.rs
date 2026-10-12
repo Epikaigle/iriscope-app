@@ -261,6 +261,7 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
     let viewer_frame_count_close = Arc::clone(&viewer_video_frame_count);
     let viewer_seek_close = Arc::clone(&viewer_video_seek_request);
     let viewer_display_close = Arc::clone(&viewer_display_mailbox);
+    let viewer_mailbox_close = Arc::clone(&viewer_open_mailbox);
     let weak_close_viewer = main_window.as_weak();
     main_window.global::<AppState>().on_close_viewer(move || {
         if let Some(win) = weak_close_viewer.upgrade() {
@@ -282,6 +283,7 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
             seek.epoch = seek.epoch.wrapping_add(1);
             seek.requested_frame = None;
         }
+        viewer_mailbox_close.signal_playback_change();
         if let Some(win) = weak_close_viewer.upgrade() {
             win.set_viewer_open(false);
             win.global::<AppState>().set_viewer_navigation_direction(0);
@@ -290,12 +292,14 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
     });
 
     let viewer_playing_toggle = Arc::clone(&viewer_video_playing);
+    let viewer_mailbox_toggle = Arc::clone(&viewer_open_mailbox);
     let weak_toggle_viewer = main_window.as_weak();
     main_window
         .global::<AppState>()
         .on_toggle_viewer_video(move || {
-            let playing = !viewer_playing_toggle.load(Ordering::Relaxed);
-            viewer_playing_toggle.store(playing, Ordering::Relaxed);
+            let playing = !viewer_playing_toggle.load(Ordering::Acquire);
+            viewer_playing_toggle.store(playing, Ordering::Release);
+            viewer_mailbox_toggle.signal_playback_change();
             if let Some(win) = weak_toggle_viewer.upgrade() {
                 win.set_viewer_video_playing(playing);
             }
@@ -303,6 +307,7 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
 
     let viewer_frame_count_seek = Arc::clone(&viewer_video_frame_count);
     let viewer_seek_request = Arc::clone(&viewer_video_seek_request);
+    let viewer_mailbox_seek = Arc::clone(&viewer_open_mailbox);
     main_window
         .global::<AppState>()
         .on_seek_viewer_video(move |progress| {
@@ -317,6 +322,8 @@ pub(super) fn install(main_window: &MainWindow, runtime: &AppRuntime) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             seek.epoch = seek.epoch.wrapping_add(1);
             seek.requested_frame = Some(frame_index);
+            drop(seek);
+            viewer_mailbox_seek.signal_playback_change();
         });
 }
 
